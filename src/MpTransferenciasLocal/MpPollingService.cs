@@ -9,6 +9,8 @@ class MpPollingService : BackgroundService
     private readonly IConfiguration _cfg;
     private readonly ConcurrentQueue<object> _queue;
 
+    private static readonly TimeZoneInfo ArTz = GetArgentinaTimeZone();
+
     public MpPollingService(
         IHttpClientFactory http,
         IConfiguration cfg,
@@ -17,29 +19,6 @@ class MpPollingService : BackgroundService
         _http = http;
         _cfg = cfg;
         _queue = queue;
-    }
-
-    // =========================
-    // TIMEZONE ARGENTINA
-    // =========================
-    private static TimeZoneInfo GetBuenosAiresTz()
-    {
-        // Linux (Render)
-        try { return TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires"); }
-        catch { }
-
-        // Windows
-        try { return TimeZoneInfo.FindSystemTimeZoneById("Argentina Standard Time"); }
-        catch { }
-
-        return TimeZoneInfo.Utc;
-    }
-
-    private static string FormatBuenosAires(DateTimeOffset dto)
-    {
-        var tz = GetBuenosAiresTz();
-        var dt = TimeZoneInfo.ConvertTime(dto.UtcDateTime, tz);
-        return dt.ToString("yyyy-MM-dd HH:mm:ss");
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -54,7 +33,10 @@ class MpPollingService : BackgroundService
         }
 
         var seconds = int.TryParse(_cfg["Polling:Seconds"], out var s) ? s : 10;
-        DateTimeOffset? lastSeenUtc = null;
+
+        // OJO: MP devuelve los últimos 20 ordenados desc.
+        // lastSeen guarda el más “nuevo” que ya procesamos.
+        DateTimeOffset? lastSeen = null;
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -68,32 +50,40 @@ class MpPollingService : BackgroundService
                     "v1/payments/search?sort=date_created&criteria=desc&limit=20",
                     stoppingToken);
 
-                using var doc = JsonDocument.Parse(
-                    await resp.Content.ReadAsStringAsync(stoppingToken));
+                var json = await resp.Content.ReadAsStringAsync(stoppingToken);
+                using var doc = JsonDocument.Parse(json);
 
                 if (!doc.RootElement.TryGetProperty("results", out var results))
-                    goto WAIT;
+                    goto Sleep;
 
                 foreach (var item in results.EnumerateArray())
                 {
+                    // MP suele mandar ISO con offset. Esto queda perfecto en DateTimeOffset.
                     var created = item.GetProperty("date_created").GetDateTimeOffset();
 
-                    if (lastSeenUtc != null && created <= lastSeenUtc)
-                        continue;
+                    // Como viene desc, el primero es el más nuevo.
+                    if (lastSeen != null && created <= lastSeen) continue;
+
+                    // Convertimos a hora Argentina SIEMPRE (Render está en UTC)
+                    var createdAr = TimeZoneInfo.ConvertTime(created, ArTz);
 
                     _queue.Enqueue(new
                     {
                         cuenta,
                         id = item.GetProperty("id").ToString(),
-                        fecha = FormatBuenosAires(created), // ✅ Argentina
+
+                        // te dejo ambas por si después querés agrupar por día AR
+                        fecha_utc = created.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                        fecha_ar = createdAr.ToString("yyyy-MM-dd HH:mm:ss"),
+
                         monto = item.GetProperty("transaction_amount").GetDecimal(),
-                        status = item.GetProperty("status").GetString(),
-                        payment_type_id = item.GetProperty("payment_type_id").GetString()
+                        status = item.TryGetProperty("status", out var st) ? st.GetString() : null,
+                        payment_type_id = item.TryGetProperty("payment_type_id", out var pt) ? pt.GetString() : null,
+                        json_raw = json // opcional, si querés debug (si te molesta, lo sacamos)
                     });
 
-                    // El listado viene ordenado DESC
-                    if (lastSeenUtc == null || created > lastSeenUtc)
-                        lastSeenUtc = created;
+                    // actualizamos lastSeen al más nuevo procesado
+                    if (lastSeen == null || created > lastSeen) lastSeen = created;
                 }
             }
             catch (Exception ex)
@@ -101,8 +91,22 @@ class MpPollingService : BackgroundService
                 _queue.Enqueue(new { cuenta, error = ex.Message });
             }
 
-        WAIT:
+        Sleep:
             await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
         }
+    }
+
+    private static TimeZoneInfo GetArgentinaTimeZone()
+    {
+        // Linux (Render): "America/Argentina/Buenos_Aires"
+        try { return TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires"); }
+        catch { /* ignore */ }
+
+        // Windows: "Argentina Standard Time"
+        try { return TimeZoneInfo.FindSystemTimeZoneById("Argentina Standard Time"); }
+        catch { /* ignore */ }
+
+        // Fallback: UTC (no debería pasar)
+        return TimeZoneInfo.Utc;
     }
 }
