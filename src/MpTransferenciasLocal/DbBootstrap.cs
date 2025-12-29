@@ -2,9 +2,21 @@ using Npgsql;
 
 static class DbBootstrap
 {
+    using Npgsql;
+
+static class DbBootstrap
+{
     public static async Task EnsureCreatedAsync(IConfiguration cfg)
     {
         var cs = cfg.GetConnectionString("Db");
+
+        // Render suele dar postgres://user:pass@host:port/db
+        // Npgsql a veces necesita formato "Host=...;Username=...;Password=...;Database=...".
+        if (!string.IsNullOrWhiteSpace(cs) && cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase))
+        {
+            cs = ConvertPostgresUrlToConnectionString(cs);
+        }
+
         if (string.IsNullOrWhiteSpace(cs))
         {
             Console.WriteLine("⚠ ConnectionStrings:Db vacío. No se crea DB.");
@@ -13,55 +25,31 @@ static class DbBootstrap
 
         await using var conn = new NpgsqlConnection(cs);
         await conn.OpenAsync();
+}
 
-        var sql = """
-        create table if not exists mp_accounts (
-            id              serial primary key,
-            nombre          text not null,
-            access_token    text not null,
-            activa          boolean not null default true
-        );
+    private static string ConvertPostgresUrlToConnectionString(string url)
+    {
+        // postgres://user:pass@host:port/dbname
+        var uri = new Uri(url);
 
-        create table if not exists app_users (
-            username    text primary key,
-            role        text not null default 'sucursal'
-        );
+        var userInfo = uri.UserInfo.Split(':', 2);
+        var user = Uri.UnescapeDataString(userInfo[0]);
+        var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
 
-        create table if not exists user_mp_account (
-            username        text primary key references app_users(username) on delete cascade,
-            mp_account_id   int not null references mp_accounts(id) on delete cascade
-        );
+        var db = uri.AbsolutePath.TrimStart('/');
 
-        create table if not exists transfers (
-            id              bigserial primary key,
-            mp_account_id   int not null references mp_accounts(id) on delete cascade,
-            payment_id      text not null,
-            fecha_utc       timestamptz not null,
-            monto           numeric(18,2) not null,
-            status          text null,
-            payment_type    text null,
-            json_raw        jsonb null,
-            created_at      timestamptz not null default now(),
-            unique (mp_account_id, payment_id)
-        );
+        var builder = new NpgsqlConnectionStringBuilder
+        {
+            Host = uri.Host,
+            Port = uri.Port > 0 ? uri.Port : 5432,
+            Username = user,
+            Password = pass,
+            Database = db,
+            // SSL requerido en Render normalmente
+            SslMode = SslMode.Require,
+            TrustServerCertificate = true
+        };
 
-        create table if not exists transfer_ack (
-            id              bigserial primary key,
-            transfer_id     bigint not null references transfers(id) on delete cascade,
-            username        text not null references app_users(username) on delete restrict,
-            ack_at_utc      timestamptz not null default now(),
-            ack_date_ar     date not null,
-            unique (transfer_id)
-        );
-
-        create index if not exists ix_transfers_fecha on transfers(fecha_utc desc);
-        create index if not exists ix_transfers_account on transfers(mp_account_id, fecha_utc desc);
-        create index if not exists ix_ack_date_user on transfer_ack(ack_date_ar, username);
-        """;
-
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        await cmd.ExecuteNonQueryAsync();
-
-        Console.WriteLine("✅ DB ready: tablas creadas/verificadas");
+        return builder.ConnectionString;
     }
 }
