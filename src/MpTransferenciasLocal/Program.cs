@@ -85,46 +85,13 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
     }
 }
 
-static Dictionary<string, AuthUser> LoadAuthUsers(IConfiguration cfg)
-{
-    var list = cfg.GetSection("Auth:Users").Get<List<AuthUser>>() ?? new List<AuthUser>();
-    var dict = new Dictionary<string, AuthUser>(StringComparer.OrdinalIgnoreCase);
 
-    foreach (var u in list)
-    {
-        if (string.IsNullOrWhiteSpace(u.User) || string.IsNullOrWhiteSpace(u.Pass)) continue;
-        dict[u.User] = u;
-    }
-
-    // Fallback simple (por si alguna vez querés usar Auth__User / Auth__Pass)
-    var singleUser = cfg["Auth:User"];
-    var singlePass = cfg["Auth:Pass"];
-    var singleRole = cfg["Auth:Role"];
-
-    if (!string.IsNullOrWhiteSpace(singleUser) && !string.IsNullOrWhiteSpace(singlePass))
-    {
-        dict[singleUser] = new AuthUser
-        {
-            User = singleUser,
-            Pass = singlePass,
-            Role = string.IsNullOrWhiteSpace(singleRole) ? "admin" : singleRole
-        };
-    }
-
-    return dict;
-}
-
-sealed class AuthUser
-{
-    public string User { get; set; } = "";
-    public string Pass { get; set; } = "";
-    public string? Role { get; set; }
-}
 
 var app = builder.Build();
 
 // ================= AUTH (Basic) =================
-var authUsers = LoadAuthUsers(app.Configuration);
+var authUsers = AuthHelpers.LoadAuthUsers(app.Configuration);
+
 
 if (authUsers.Count > 0)
 {
@@ -388,103 +355,3 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 app.Run();
 
 // ================= POLLING SERVICE =================
-class MpPollingService : BackgroundService
-{
-    private readonly IHttpClientFactory _http;
-    private readonly IConfiguration _cfg;
-    private readonly ConcurrentQueue<object> _queue;
-
-    public MpPollingService(IHttpClientFactory http, IConfiguration cfg, ConcurrentQueue<object> queue)
-    {
-        _http = http;
-        _cfg = cfg;
-        _queue = queue;
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var token = _cfg["MercadoPago:AccessToken"];
-        var cuenta = _cfg["Cuenta"] ?? "Cuenta";
-
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            _queue.Enqueue(new { cuenta, error = "FALTA AccessToken (no se leyó config)" });
-            return;
-        }
-
-        var tzAr = GetArgentinaTimeZone();
-
-        var seconds = int.TryParse(_cfg["Polling:Seconds"], out var s) ? s : 10;
-        DateTimeOffset? lastSeenUtc = null;
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                var client = _http.CreateClient("MP");
-                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-                var resp = await client.GetAsync("v1/payments/search?sort=date_created&criteria=desc&limit=20", stoppingToken);
-                var raw = await resp.Content.ReadAsStringAsync(stoppingToken);
-
-                using var doc = JsonDocument.Parse(raw);
-                if (!doc.RootElement.TryGetProperty("results", out var results)) continue;
-
-                var ahoraUtc = DateTimeOffset.UtcNow;
-                var hace5Utc = ahoraUtc.AddMinutes(-5);
-
-                DateTimeOffset? maxCreatedUtc = null;
-
-                foreach (var item in results.EnumerateArray())
-                {
-                    var dateStr = item.GetProperty("date_created").GetString();
-                    if (!DateTimeOffset.TryParse(dateStr, out var created)) continue;
-
-                    var createdUtc = created.ToUniversalTime();
-
-                    if (createdUtc < hace5Utc) continue;
-
-                    var paymentType = item.GetProperty("payment_type_id").GetString();
-                    if (paymentType != "account_money" && paymentType != "bank_transfer") continue;
-
-                    if (maxCreatedUtc == null || createdUtc > maxCreatedUtc) maxCreatedUtc = createdUtc;
-                    if (lastSeenUtc != null && createdUtc <= lastSeenUtc) continue;
-
-                    var createdAr = TimeZoneInfo.ConvertTime(createdUtc, tzAr);
-
-                    _queue.Enqueue(new
-                    {
-                        cuenta,
-                        id = item.GetProperty("id").ToString(),
-                        fecha = createdAr.ToString("yyyy-MM-dd HH:mm:ss"),
-                        monto = item.TryGetProperty("transaction_amount", out var ta) ? ta.GetDecimal() : 0,
-                        status = item.GetProperty("status").GetString(),
-                        payment_type_id = paymentType,
-                        payment_method_id = item.TryGetProperty("payment_method_id", out var pm) ? pm.GetString() : ""
-                    });
-
-                    while (_queue.Count > 200) _queue.TryDequeue(out _);
-                }
-
-                if (maxCreatedUtc != null) lastSeenUtc = maxCreatedUtc;
-            }
-            catch (Exception ex)
-            {
-                _queue.Enqueue(new { cuenta, error = ex.Message });
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
-        }
-    }
-
-    private static TimeZoneInfo GetArgentinaTimeZone()
-    {
-        try { return TimeZoneInfo.FindSystemTimeZoneById("Argentina Standard Time"); }
-        catch { }
-
-        try { return TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires"); }
-        catch { }
-
-        return TimeZoneInfo.Local;
-    }
-}
