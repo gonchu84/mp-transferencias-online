@@ -4,7 +4,6 @@ using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
-using Microsoft.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -54,6 +53,12 @@ builder.Services.AddHttpClient("MP", c =>
 builder.Services.AddSingleton<ConcurrentQueue<object>>();
 builder.Services.AddHostedService<MpPollingService>();
 
+// ✅ Controllers para /api/transfers/*
+builder.Services.AddControllers();
+
+// ✅ Authorization para que [Authorize] funcione con ctx.User seteado
+builder.Services.AddAuthorization();
+
 // ================= HELPERS (TOP-LEVEL SAFE) =================
 bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
 {
@@ -85,16 +90,14 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
     }
 }
 
-
-
 var app = builder.Build();
 
+// ================= DB INIT =================
 await DbBootstrap.EnsureCreatedAsync(app.Configuration);
 await DbSeed.SeedAsync(app.Configuration.GetConnectionString("Db")!);
 
 // ================= AUTH (Basic) =================
 var authUsers = AuthHelpers.LoadAuthUsers(app.Configuration);
-
 
 if (authUsers.Count > 0)
 {
@@ -119,8 +122,8 @@ if (authUsers.Count > 0)
                     new(ClaimTypes.Name, u.User),
                     new(ClaimTypes.Role, string.IsNullOrWhiteSpace(u.Role) ? "Sucursal" : u.Role!)
                 };
-                ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
 
+                ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
                 await next();
                 return;
             }
@@ -131,6 +134,9 @@ if (authUsers.Count > 0)
         await ctx.Response.WriteAsync("Unauthorized");
     });
 }
+
+// ✅ Authorization middleware (necesario para [Authorize])
+app.UseAuthorization();
 
 // ================= LOG =================
 Console.WriteLine("========================================");
@@ -149,6 +155,9 @@ Console.WriteLine("========================================");
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
 
 app.MapGet("/api/transferencias", (ConcurrentQueue<object> q) => Results.Ok(q.ToArray()));
+
+// ✅ Mapea controllers (/api/transfers/...)
+app.MapControllers();
 
 app.MapGet("/", (ConcurrentQueue<object> q, IConfiguration cfg) =>
 {
@@ -356,5 +365,3 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 });
 
 app.Run();
-
-// ================= POLLING SERVICE =================
