@@ -25,12 +25,12 @@ static class DbBootstrap
 
         var sql = """
 create table if not exists mp_accounts (
-    id              bigserial primary key,
-    nombre          text not null unique,
-    access_token    text not null,
-    activa          boolean not null default true,
-    created_at      timestamptz not null default now()
+    id serial primary key,
+    nombre text not null unique,
+    access_token text not null,
+    activa boolean not null default true
 );
+
 
 create table if not exists app_users (
     username    text primary key,
