@@ -17,7 +17,17 @@ static class DbSeed
         await using var conn = new NpgsqlConnection(cs);
         await conn.OpenAsync();
 
+        // Tokens por ENV (Render -> Environment Variables)
+        // Si no están, dejamos la cuenta inactiva con token "PENDING".
+        var tokGon  = Environment.GetEnvironmentVariable("MP_TOKEN_MP_GON");
+        var tokTaty = Environment.GetEnvironmentVariable("MP_TOKEN_MP_TATY");
+        var tokMaty = Environment.GetEnvironmentVariable("MP_TOKEN_MP_MATY");
+
+        string TokenOrPending(string? t) => string.IsNullOrWhiteSpace(t) ? "PENDING" : t!;
+        bool ActiveOrNot(string? t) => !string.IsNullOrWhiteSpace(t);
+
         var sql = """
+        -- 1) Usuarios
         insert into app_users (username, role) values
         ('admin', 'admin'),
         ('Banfield', 'sucursal'),
@@ -32,14 +42,38 @@ static class DbSeed
         ('MarStand', 'sucursal')
         on conflict do nothing;
 
-        -- OJO: para usar on conflict do nothing acá,
-        -- mp_accounts necesita una restricción unique por nombre.
+        -- 2) Cuentas MP (multi-cuenta)
+        insert into mp_accounts (nombre, access_token, activa) values
+        ('MP_GON',  @tokGon,  @actGon),
+        ('MP_TATY', @tokTaty, @actTaty),
+        ('MP_MATY', @tokMaty, @actMaty)
+        on conflict (nombre) do update
+        set access_token = excluded.access_token,
+            activa = excluded.activa;
+
+        -- 3) Asignación inicial (por ahora TODAS las sucursales -> MP_GON)
+        -- (admin no necesita asignación)
+        insert into user_mp_account (username, mp_account_id)
+        select u.username, a.id
+        from app_users u
+        join mp_accounts a on a.nombre = 'MP_GON'
+        where u.role = 'sucursal'
+        on conflict (username) do nothing;
         """;
 
         await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("tokGon",  TokenOrPending(tokGon));
+        cmd.Parameters.AddWithValue("tokTaty", TokenOrPending(tokTaty));
+        cmd.Parameters.AddWithValue("tokMaty", TokenOrPending(tokMaty));
+        cmd.Parameters.AddWithValue("actGon",  ActiveOrNot(tokGon));
+        cmd.Parameters.AddWithValue("actTaty", ActiveOrNot(tokTaty));
+        cmd.Parameters.AddWithValue("actMaty", ActiveOrNot(tokMaty));
+
         await cmd.ExecuteNonQueryAsync();
 
-        Console.WriteLine("✅ Datos iniciales (usuarios) cargados");
+        Console.WriteLine("✅ Datos iniciales cargados: usuarios + cuentas MP + asignación inicial");
+        if (!ActiveOrNot(tokGon) || !ActiveOrNot(tokTaty) || !ActiveOrNot(tokMaty))
+            Console.WriteLine("⚠ Ojo: faltan tokens MP_* en ENV. Se cargaron como PENDING (activa=false).");
     }
 
     private static string ConvertPostgresUrlToConnectionString(string url)
