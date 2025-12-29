@@ -513,4 +513,35 @@ class MpPollingService : BackgroundService
 
         return TimeZoneInfo.Local;
     }
+    
+}
+static bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
+{
+    user = string.Empty;
+    pass = string.Empty;
+
+    if (string.IsNullOrWhiteSpace(authHeader))
+        return false;
+
+    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+        return false;
+
+    try
+    {
+        var encoded = authHeader.Substring("Basic ".Length).Trim();
+        var decodedBytes = Convert.FromBase64String(encoded);
+        var decoded = System.Text.Encoding.UTF8.GetString(decodedBytes);
+
+        var parts = decoded.Split(':', 2);
+        if (parts.Length != 2)
+            return false;
+
+        user = parts[0];
+        pass = parts[1];
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
 }
