@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -52,6 +53,38 @@ builder.Services.AddHttpClient("MP", c =>
 builder.Services.AddSingleton<ConcurrentQueue<object>>();
 builder.Services.AddHostedService<MpPollingService>();
 
+// ================= HELPERS (TOP-LEVEL SAFE) =================
+// En top-level program, helpers deben ser "local functions" (antes de builder.Build()).
+bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
+{
+    user = string.Empty;
+    pass = string.Empty;
+
+    if (string.IsNullOrWhiteSpace(authHeader))
+        return false;
+
+    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+        return false;
+
+    try
+    {
+        var encoded = authHeader["Basic ".Length..].Trim();
+        var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
+        var parts = decoded.Split(':', 2);
+
+        if (parts.Length != 2)
+            return false;
+
+        user = parts[0];
+        pass = parts[1];
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
 var app = builder.Build();
 
 // ================= AUTH (Basic) =================
@@ -70,42 +103,28 @@ if (authUsers.Count > 0)
             return;
         }
 
-        var header = ctx.Request.Headers.Authorization.ToString();
-        if (header.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+        var authHeader = ctx.Request.Headers.Authorization.ToString();
+
+        if (TryGetBasicCredentials(authHeader, out var user, out var pass))
         {
-            try
+            if (authUsers.TryGetValue(user, out var u) && u.Pass == pass)
             {
-                var encoded = header["Basic ".Length..].Trim();
-                var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
-                var parts = decoded.Split(':', 2);
-
-                if (parts.Length == 2)
+                // Identidad simple (roles/admin a futuro)
+                var claims = new List<Claim>
                 {
-                    var user = parts[0];
-                    var pass = parts[1];
+                    new(ClaimTypes.Name, u.User),
+                    new(ClaimTypes.Role, string.IsNullOrWhiteSpace(u.Role) ? "Sucursal" : u.Role!)
+                };
+                ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
 
-                    if (authUsers.TryGetValue(user, out var u) && u.Pass == pass)
-                    {
-                        // Setear identidad simple (por si más adelante querés roles/admin)
-                        var claims = new List<Claim>
-                        {
-                            new(ClaimTypes.Name, u.User),
-                            new(ClaimTypes.Role, u.Role ?? "user")
-                        };
-                        ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
-                        await next();
-                        return;
-                    }
-                }
-            }
-            catch
-            {
-                // ignore -> cae en 401
+                await next();
+                return;
             }
         }
 
         ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
         ctx.Response.StatusCode = 401;
+        await ctx.Response.WriteAsync("Unauthorized");
     });
 }
 
@@ -119,55 +138,8 @@ Console.WriteLine("Cuenta: " + (builder.Configuration["Cuenta"] ?? "(null)"));
 Console.WriteLine("Alias: " + (builder.Configuration["Alias"] ?? "(null)"));
 Console.WriteLine("CVU: " + (builder.Configuration["CVU"] ?? "(null)"));
 Console.WriteLine("Token OK?: " + (!string.IsNullOrWhiteSpace(builder.Configuration["MercadoPago:AccessToken"])));
+Console.WriteLine("Auth Users: " + authUsers.Count);
 Console.WriteLine("========================================");
-
-// ================= AUTH (BASIC) =================
-// Config esperada (por appsettings o variables de entorno):
-// Auth:Users: [ {"User":"admin","Pass":"clave","Role":"Admin"}, {"User":"banfield","Pass":"...","Role":"Sucursal"} ]
-// En variables de entorno:
-// Auth__Users__0__User, Auth__Users__0__Pass, Auth__Users__0__Role, etc.
-
-var users = (builder.Configuration.GetSection("Auth:Users").Get<List<AuthUser>>() ?? new List<AuthUser>())
-    .Where(u => !string.IsNullOrWhiteSpace(u.User) && !string.IsNullOrWhiteSpace(u.Pass))
-    .ToList();
-
-if (users.Count > 0)
-{
-    app.Use(async (ctx, next) =>
-    {
-        // Permitimos health sin auth (útil para monitoreo del host)
-        if (ctx.Request.Path.StartsWithSegments("/health"))
-        {
-            await next();
-            return;
-        }
-
-        if (TryGetBasicCredentials(ctx.Request.Headers.Authorization, out var user, out var pass))
-        {
-            var match = users.FirstOrDefault(u =>
-                string.Equals(u.User, user, StringComparison.Ordinal) &&
-                string.Equals(u.Pass, pass, StringComparison.Ordinal));
-
-            if (match != null)
-            {
-                var claims = new List<Claim>
-                {
-                    new(ClaimTypes.Name, match.User),
-                    new(ClaimTypes.Role, string.IsNullOrWhiteSpace(match.Role) ? "Sucursal" : match.Role)
-                };
-                var identity = new ClaimsIdentity(claims, "Basic");
-                ctx.User = new ClaimsPrincipal(identity);
-
-                await next();
-                return;
-            }
-        }
-
-        ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
-        ctx.Response.StatusCode = 401;
-        await ctx.Response.WriteAsync("Unauthorized");
-    });
-}
 
 // ================= ENDPOINTS =================
 
@@ -388,15 +360,15 @@ app.Run();
 
 static Dictionary<string, AuthUser> LoadAuthUsers(IConfiguration cfg)
 {
-    // Ejemplo esperado en JSON:
-    // "Auth": { "Users": [ { "User":"admin", "Pass":"123", "Role":"admin" } ] }
     var list = cfg.GetSection("Auth:Users").Get<List<AuthUser>>() ?? new List<AuthUser>();
     var dict = new Dictionary<string, AuthUser>(StringComparer.OrdinalIgnoreCase);
+
     foreach (var u in list)
     {
         if (string.IsNullOrWhiteSpace(u.User) || string.IsNullOrWhiteSpace(u.Pass)) continue;
         dict[u.User] = u;
     }
+
     return dict;
 }
 
@@ -451,7 +423,6 @@ class MpPollingService : BackgroundService
                 using var doc = JsonDocument.Parse(raw);
                 if (!doc.RootElement.TryGetProperty("results", out var results)) continue;
 
-                // ✅ Filtro en UTC
                 var ahoraUtc = DateTimeOffset.UtcNow;
                 var hace5Utc = ahoraUtc.AddMinutes(-5);
 
@@ -474,7 +445,7 @@ class MpPollingService : BackgroundService
                     if (maxCreatedUtc == null || createdUtc > maxCreatedUtc) maxCreatedUtc = createdUtc;
                     if (lastSeenUtc != null && createdUtc <= lastSeenUtc) continue;
 
-                    // ✅ Mostrar hora Argentina
+                    // Mostrar hora Argentina
                     var createdAr = TimeZoneInfo.ConvertTime(createdUtc, tzAr);
 
                     _queue.Enqueue(new
@@ -502,7 +473,6 @@ class MpPollingService : BackgroundService
         }
     }
 
-    // ✅ Dentro de la clase (evita CS8801) y compatible Windows/Linux
     private static TimeZoneInfo GetArgentinaTimeZone()
     {
         try { return TimeZoneInfo.FindSystemTimeZoneById("Argentina Standard Time"); }
@@ -512,36 +482,5 @@ class MpPollingService : BackgroundService
         catch { }
 
         return TimeZoneInfo.Local;
-    }
-    
-}
-static bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
-{
-    user = string.Empty;
-    pass = string.Empty;
-
-    if (string.IsNullOrWhiteSpace(authHeader))
-        return false;
-
-    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
-        return false;
-
-    try
-    {
-        var encoded = authHeader.Substring("Basic ".Length).Trim();
-        var decodedBytes = Convert.FromBase64String(encoded);
-        var decoded = System.Text.Encoding.UTF8.GetString(decodedBytes);
-
-        var parts = decoded.Split(':', 2);
-        if (parts.Length != 2)
-            return false;
-
-        user = parts[0];
-        pass = parts[1];
-        return true;
-    }
-    catch
-    {
-        return false;
     }
 }
