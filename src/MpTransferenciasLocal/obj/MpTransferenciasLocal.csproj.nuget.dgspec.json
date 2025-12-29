@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\MPTransferenciasLocal_Instalable\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {}
+    "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {}
   },
   "projects": {
-    "C:\\MPTransferenciasLocal_Instalable\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {
+    "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\MPTransferenciasLocal_Instalable\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
+        "projectUniqueName": "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
         "projectName": "MpTransferenciasLocal",
-        "projectPath": "C:\\MPTransferenciasLocal_Instalable\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
+        "projectPath": "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
         "packagesPath": "C:\\Users\\Usuario\\.nuget\\packages\\",
-        "outputPath": "C:\\MPTransferenciasLocal_Instalable\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\obj\\",
+        "outputPath": "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\Usuario\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -42,6 +42,12 @@
       "frameworks": {
         "net8.0": {
           "targetAlias": "net8.0",
+          "dependencies": {
+            "Npgsql": {
+              "target": "Package",
+              "version": "[10.0.1, )"
+            }
+          },
           "imports": [
             "net461",
             "net462",
