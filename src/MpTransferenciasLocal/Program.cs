@@ -90,6 +90,7 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
 var app = builder.Build();
 
 await DbBootstrap.EnsureCreatedAsync(app.Configuration);
+await DbSeed.SeedAsync(app.Configuration.GetConnectionString("Db")!);
 
 // ================= AUTH (Basic) =================
 var authUsers = AuthHelpers.LoadAuthUsers(app.Configuration);
