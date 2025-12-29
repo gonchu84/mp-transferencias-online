@@ -9,16 +9,15 @@ using Microsoft.Extensions.Hosting;
 var builder = WebApplication.CreateBuilder(args);
 
 // ================= ONLINE HOSTING (Render/Docker/VPS) =================
-// Render (y muchos hosts) inyectan PORT. Si no existe, usamos 5286 como fallback.
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5286";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // ================= CONFIG =================
-
-// Base
-builder.Configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
-
-// ✅ Override por cuenta (publish / dotnet run)
+//
+// OJO: CreateBuilder() YA agrega appsettings + env vars.
+// Si volvemos a agregar JSON después, podemos pisar env vars.
+// Entonces: agregamos SOLO el appsettings.Sucursal.json y
+// volvemos a agregar EnvironmentVariables AL FINAL para que ganen.
 var configFromExe = Path.Combine(AppContext.BaseDirectory, "config", "appsettings.Sucursal.json");
 var configFromDev = Path.GetFullPath(
     Path.Combine(builder.Environment.ContentRootPath, "..", "..", "config", "appsettings.Sucursal.json")
@@ -43,8 +42,10 @@ else
     Console.WriteLine(" - " + configFromDev);
 }
 
-// ================= SERVICES =================
+// ✅ IMPORTANTE: asegurar que las variables de entorno pisan a los JSON
+builder.Configuration.AddEnvironmentVariables();
 
+// ================= SERVICES =================
 builder.Services.AddHttpClient("MP", c =>
 {
     c.BaseAddress = new Uri("https://api.mercadopago.com/");
@@ -54,7 +55,6 @@ builder.Services.AddSingleton<ConcurrentQueue<object>>();
 builder.Services.AddHostedService<MpPollingService>();
 
 // ================= HELPERS (TOP-LEVEL SAFE) =================
-// En top-level program, helpers deben ser "local functions" (antes de builder.Build()).
 bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
 {
     user = string.Empty;
@@ -85,11 +85,45 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
     }
 }
 
+static Dictionary<string, AuthUser> LoadAuthUsers(IConfiguration cfg)
+{
+    var list = cfg.GetSection("Auth:Users").Get<List<AuthUser>>() ?? new List<AuthUser>();
+    var dict = new Dictionary<string, AuthUser>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var u in list)
+    {
+        if (string.IsNullOrWhiteSpace(u.User) || string.IsNullOrWhiteSpace(u.Pass)) continue;
+        dict[u.User] = u;
+    }
+
+    // Fallback simple (por si alguna vez querés usar Auth__User / Auth__Pass)
+    var singleUser = cfg["Auth:User"];
+    var singlePass = cfg["Auth:Pass"];
+    var singleRole = cfg["Auth:Role"];
+
+    if (!string.IsNullOrWhiteSpace(singleUser) && !string.IsNullOrWhiteSpace(singlePass))
+    {
+        dict[singleUser] = new AuthUser
+        {
+            User = singleUser,
+            Pass = singlePass,
+            Role = string.IsNullOrWhiteSpace(singleRole) ? "admin" : singleRole
+        };
+    }
+
+    return dict;
+}
+
+sealed class AuthUser
+{
+    public string User { get; set; } = "";
+    public string Pass { get; set; } = "";
+    public string? Role { get; set; }
+}
+
 var app = builder.Build();
 
 // ================= AUTH (Basic) =================
-// Soporta múltiples usuarios (pensado para 11 sucursales + 1 admin).
-// Se configura con Auth:Users (array) por appsettings o variables de entorno.
 var authUsers = LoadAuthUsers(app.Configuration);
 
 if (authUsers.Count > 0)
@@ -103,13 +137,13 @@ if (authUsers.Count > 0)
             return;
         }
 
-        var authHeader = ctx.Request.Headers.Authorization.ToString();
+        // ✅ leer header de forma segura
+        var authHeader = ctx.Request.Headers["Authorization"].ToString();
 
         if (TryGetBasicCredentials(authHeader, out var user, out var pass))
         {
             if (authUsers.TryGetValue(user, out var u) && u.Pass == pass)
             {
-                // Identidad simple (roles/admin a futuro)
                 var claims = new List<Claim>
                 {
                     new(ClaimTypes.Name, u.User),
@@ -129,7 +163,6 @@ if (authUsers.Count > 0)
 }
 
 // ================= LOG =================
-
 Console.WriteLine("========================================");
 Console.WriteLine("MPTransferenciasLocal iniciado");
 Console.WriteLine("ContentRootPath: " + builder.Environment.ContentRootPath);
@@ -139,16 +172,14 @@ Console.WriteLine("Alias: " + (builder.Configuration["Alias"] ?? "(null)"));
 Console.WriteLine("CVU: " + (builder.Configuration["CVU"] ?? "(null)"));
 Console.WriteLine("Token OK?: " + (!string.IsNullOrWhiteSpace(builder.Configuration["MercadoPago:AccessToken"])));
 Console.WriteLine("Auth Users: " + authUsers.Count);
+Console.WriteLine("Auth Usernames: " + (authUsers.Count == 0 ? "(none)" : string.Join(", ", authUsers.Keys)));
 Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
-
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
 
-// Endpoint JSON (por si lo usás desde otro lado)
 app.MapGet("/api/transferencias", (ConcurrentQueue<object> q) => Results.Ok(q.ToArray()));
 
-// UI HTML
 app.MapGet("/", (ConcurrentQueue<object> q, IConfiguration cfg) =>
 {
     var cuenta = cfg["Cuenta"] ?? "Cuenta";
@@ -356,31 +387,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 
 app.Run();
 
-// ================= HELPERS =================
-
-static Dictionary<string, AuthUser> LoadAuthUsers(IConfiguration cfg)
-{
-    var list = cfg.GetSection("Auth:Users").Get<List<AuthUser>>() ?? new List<AuthUser>();
-    var dict = new Dictionary<string, AuthUser>(StringComparer.OrdinalIgnoreCase);
-
-    foreach (var u in list)
-    {
-        if (string.IsNullOrWhiteSpace(u.User) || string.IsNullOrWhiteSpace(u.Pass)) continue;
-        dict[u.User] = u;
-    }
-
-    return dict;
-}
-
-sealed class AuthUser
-{
-    public string User { get; set; } = "";
-    public string Pass { get; set; } = "";
-    public string? Role { get; set; }
-}
-
 // ================= POLLING SERVICE =================
-
 class MpPollingService : BackgroundService
 {
     private readonly IHttpClientFactory _http;
@@ -435,17 +442,14 @@ class MpPollingService : BackgroundService
 
                     var createdUtc = created.ToUniversalTime();
 
-                    // SOLO últimos 5 minutos
                     if (createdUtc < hace5Utc) continue;
 
-                    // SOLO transferencias
                     var paymentType = item.GetProperty("payment_type_id").GetString();
                     if (paymentType != "account_money" && paymentType != "bank_transfer") continue;
 
                     if (maxCreatedUtc == null || createdUtc > maxCreatedUtc) maxCreatedUtc = createdUtc;
                     if (lastSeenUtc != null && createdUtc <= lastSeenUtc) continue;
 
-                    // Mostrar hora Argentina
                     var createdAr = TimeZoneInfo.ConvertTime(createdUtc, tzAr);
 
                     _queue.Enqueue(new
