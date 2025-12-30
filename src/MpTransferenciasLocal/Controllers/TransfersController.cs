@@ -27,22 +27,61 @@ public class TransfersController : ControllerBase
         return cs;
     }
 
-    // ✅ GET: /api/transfers/ping  (para probar rápido)
-    // Lo dejo público para testear sin drama
+    // ✅ GET: /api/transfers/ping
     [HttpGet("ping")]
-    [AllowAnonymous]
     public IActionResult Ping()
     {
+        var user = User.Identity?.Name ?? "unknown";
+
+        var tz = TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires");
+        var nowUtc = DateTimeOffset.UtcNow;
+        var nowAr = TimeZoneInfo.ConvertTime(nowUtc, tz);
+
         return Ok(new
         {
             ok = true,
-            utc = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"),
-            ar = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(-3)).ToString("yyyy-MM-dd HH:mm:ss")
+            user,
+            utc = nowUtc.ToString("yyyy-MM-dd HH:mm:ss"),
+            ar = nowAr.ToString("yyyy-MM-dd HH:mm:ss")
         });
     }
 
-    // ✅ POST: /api/transfers/payment/{paymentId}/ack
-    // Este es el que vas a usar SIEMPRE con el ID de MercadoPago (payment_id)
+    // ✅ DEBUG: /api/transfers/last
+    [HttpGet("last")]
+    public async Task<IActionResult> Last()
+    {
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+        select id, mp_account_id, payment_id, fecha_utc, monto, status, payment_type
+        from transfers
+        order by id desc
+        limit 10;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        await using var rd = await cmd.ExecuteReaderAsync();
+
+        var list = new List<object>();
+        while (await rd.ReadAsync())
+        {
+            list.Add(new
+            {
+                id = rd.GetInt64(0),
+                mp_account_id = rd.GetInt32(1),
+                payment_id = rd.GetString(2),
+                fecha_utc = rd.GetFieldValue<DateTimeOffset>(3),
+                monto = rd.GetDecimal(4),
+                status = rd.GetString(5),
+                payment_type = rd.GetString(6),
+            });
+        }
+
+        return Ok(new { ok = true, count = list.Count, items = list });
+    }
+
+    // ✅ POST: /api/transfers/payment/{paymentId}/ack  (ACK usando payment_id de MP)
     [HttpPost("payment/{paymentId}/ack")]
     public async Task<IActionResult> AckByPaymentId(string paymentId)
     {
@@ -53,21 +92,16 @@ public class TransfersController : ControllerBase
             await using var conn = new NpgsqlConnection(GetConn());
             await conn.OpenAsync();
 
-            // 1) Busco el ID interno de transfers por payment_id (MP)
+            // 1) buscar el ID interno (transfers.id) por payment_id
+            var findSql = "select id from transfers where payment_id = @paymentId limit 1;";
             long transferId;
-            const string findSql = """
-                select id
-                from transfers
-                where payment_id = @paymentId
-                limit 1;
-            """;
 
             await using (var findCmd = new NpgsqlCommand(findSql, conn))
             {
                 findCmd.Parameters.AddWithValue("paymentId", paymentId);
-                var result = await findCmd.ExecuteScalarAsync();
 
-                if (result is null)
+                var obj = await findCmd.ExecuteScalarAsync();
+                if (obj == null)
                     return NotFound(new
                     {
                         ok = false,
@@ -75,57 +109,43 @@ public class TransfersController : ControllerBase
                         paymentId
                     });
 
-                transferId = Convert.ToInt64(result);
+                transferId = (long)obj;
             }
 
-            // 2) Inserto ACK usando el ID interno (transfer_id FK)
-            // Si ya existe, devuelvo 409
-            const string insertSql = """
-                insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
-                values (
-                  @transferId,
-                  @username,
-                  now(),
-                  (now() at time zone 'America/Argentina/Buenos_Aires')::date
-                );
+            // 2) insertar ACK
+            var insertSql = """
+            insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
+            values (
+              @transferId,
+              @username,
+              now(),
+              (now() at time zone 'America/Argentina/Buenos_Aires')::date
+            );
             """;
 
-            try
+            await using (var cmd = new NpgsqlCommand(insertSql, conn))
             {
-                await using var cmd = new NpgsqlCommand(insertSql, conn);
                 cmd.Parameters.AddWithValue("transferId", transferId);
                 cmd.Parameters.AddWithValue("username", username);
 
                 await cmd.ExecuteNonQueryAsync();
+            }
 
-                return Ok(new { ok = true, paymentId, transferId, username });
-            }
-            catch (PostgresException ex) when (ex.SqlState == "23505")
-            {
-                return Conflict(new
-                {
-                    ok = false,
-                    message = "Esta transferencia ya fue aceptada (ACK ya existe).",
-                    paymentId,
-                    transferId
-                });
-            }
+            return Ok(new { ok = true, paymentId, transferId, username });
+        }
+        catch (PostgresException ex) when (ex.SqlState == "23505")
+        {
+            return Conflict(new { ok = false, message = "Esta transferencia ya fue aceptada por otra sucursal." });
         }
         catch (Exception ex)
         {
-            return StatusCode(500, new
-            {
-                ok = false,
-                message = "Error en ACK",
-                error = ex.Message
-            });
+            return StatusCode(500, new { ok = false, message = "Error en ACK", error = ex.Message });
         }
     }
 
-    // ✅ (Opcional) POST: /api/transfers/{transferId}/ack
-    // Este sirve si alguna vez querés llamar por ID interno (transfers.id)
+    // ✅ POST: /api/transfers/{transferId}/ack  (ACK por ID interno)
     [HttpPost("{transferId:long}/ack")]
-    public async Task<IActionResult> AckByTransferId(long transferId)
+    public async Task<IActionResult> Ack(long transferId)
     {
         var username = User.Identity?.Name ?? "unknown";
 
@@ -134,39 +154,27 @@ public class TransfersController : ControllerBase
             await using var conn = new NpgsqlConnection(GetConn());
             await conn.OpenAsync();
 
-            // Verifico que exista transfers.id para no caer en FK
-            const string existsSql = "select 1 from transfers where id=@id limit 1;";
-            await using (var existsCmd = new NpgsqlCommand(existsSql, conn))
-            {
-                existsCmd.Parameters.AddWithValue("id", transferId);
-                var exists = await existsCmd.ExecuteScalarAsync();
-                if (exists is null)
-                    return NotFound(new { ok = false, message = "No existe transfers.id", transferId });
-            }
-
-            const string insertSql = """
-                insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
-                values (
-                  @transferId,
-                  @username,
-                  now(),
-                  (now() at time zone 'America/Argentina/Buenos_Aires')::date
-                );
+            var sql = """
+            insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
+            values (
+              @transferId,
+              @username,
+              now(),
+              (now() at time zone 'America/Argentina/Buenos_Aires')::date
+            );
             """;
 
-            try
-            {
-                await using var cmd = new NpgsqlCommand(insertSql, conn);
-                cmd.Parameters.AddWithValue("transferId", transferId);
-                cmd.Parameters.AddWithValue("username", username);
-                await cmd.ExecuteNonQueryAsync();
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("transferId", transferId);
+            cmd.Parameters.AddWithValue("username", username);
 
-                return Ok(new { ok = true, transferId, username });
-            }
-            catch (PostgresException ex) when (ex.SqlState == "23505")
-            {
-                return Conflict(new { ok = false, message = "ACK ya existe", transferId });
-            }
+            await cmd.ExecuteNonQueryAsync();
+
+            return Ok(new { ok = true, transferId, username });
+        }
+        catch (PostgresException ex) when (ex.SqlState == "23505")
+        {
+            return Conflict(new { ok = false, message = "Esta transferencia ya fue aceptada por otra sucursal." });
         }
         catch (Exception ex)
         {
