@@ -139,8 +139,19 @@ public class TransfersController : ControllerBase
         var token = GetMpToken();
 
         // rango en UTC (MP suele trabajar con ISO)
-        var end = DateTimeOffset.UtcNow;
-        var begin = end.AddMinutes(-Math.Abs(minutes));
+   var end = DateTime.UtcNow;
+var begin = end.AddMinutes(-Math.Abs(minutes));
+
+// MP: usar UTC con Z y sin milisegundos
+string beginStr = begin.ToString("yyyy-MM-ddTHH:mm:ssZ");
+string endStr   = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+var url =
+    "https://api.mercadopago.com/v1/payments/search" +
+    "?sort=date_created&criteria=desc&limit=50" +
+    $"&range=date_created&begin_date={Uri.EscapeDataString(beginStr)}" +
+    $"&end_date={Uri.EscapeDataString(endStr)}";
+
 
         var url =
             "https://api.mercadopago.com/v1/payments/search" +
@@ -154,15 +165,16 @@ public class TransfersController : ControllerBase
         var resp = await http.GetAsync(url);
         var body = await resp.Content.ReadAsStringAsync();
 
-        return Ok(new
-        {
-            ok = resp.IsSuccessStatusCode,
-            status = (int)resp.StatusCode,
-            url,
-            begin_utc = begin.ToString("o"),
-            end_utc = end.ToString("o"),
-            body
-        });
+     return Ok(new
+{
+    ok = resp.IsSuccessStatusCode,
+    status = (int)resp.StatusCode,
+    url,
+    begin_utc = beginStr,
+    end_utc = endStr,
+    body
+});
+
     }
 
     // ✅ POST: /api/transfers/payment/{paymentId}/ack  (ACK usando payment_id)
