@@ -45,6 +45,9 @@ else
 builder.Configuration.AddEnvironmentVariables();
 
 // ================= SERVICES =================
+builder.Services.AddControllers();
+
+
 builder.Services.AddHttpClient("MP", c =>
 {
     c.BaseAddress = new Uri("https://api.mercadopago.com/");
@@ -363,5 +366,6 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 
     return Results.Content(html, "text/html; charset=utf-8");
 });
+app.MapControllers();
 
 app.Run();
