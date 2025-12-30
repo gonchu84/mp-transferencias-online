@@ -9,9 +9,6 @@ class MpPollingService : BackgroundService
     private readonly IConfiguration _cfg;
     private readonly ConcurrentQueue<object> _queue;
 
-    // ✅ Timezone AR (Render suele estar en UTC)
-    private static readonly TimeZoneInfo ArTz = TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires");
-
     public MpPollingService(
         IHttpClientFactory http,
         IConfiguration cfg,
@@ -36,6 +33,9 @@ class MpPollingService : BackgroundService
         var seconds = int.TryParse(_cfg["Polling:Seconds"], out var s) ? s : 10;
         DateTimeOffset? lastSeen = null;
 
+        // ✅ Timezone AR (funciona en Linux/Render)
+        var tzAr = TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires");
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -48,16 +48,16 @@ class MpPollingService : BackgroundService
                     "v1/payments/search?sort=date_created&criteria=desc&limit=20",
                     stoppingToken);
 
-                // Si MP responde no-200, logueamos el body para ver el motivo
+                var body = await resp.Content.ReadAsStringAsync(stoppingToken);
+
                 if (!resp.IsSuccessStatusCode)
                 {
-                    var bodyErr = await resp.Content.ReadAsStringAsync(stoppingToken);
-                    _queue.Enqueue(new { cuenta, error = $"MP {(int)resp.StatusCode}: {bodyErr}" });
+                    _queue.Enqueue(new { cuenta, error = $"MP {((int)resp.StatusCode)}", detail = body });
                     await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
                     continue;
                 }
 
-                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(stoppingToken));
+                using var doc = JsonDocument.Parse(body);
                 if (!doc.RootElement.TryGetProperty("results", out var results)) continue;
 
                 foreach (var item in results.EnumerateArray())
@@ -67,8 +67,8 @@ class MpPollingService : BackgroundService
                     if (lastSeen != null && created <= lastSeen) continue;
                     lastSeen = created;
 
-                    // ✅ Convertimos a hora AR SIEMPRE
-                    var createdAr = TimeZoneInfo.ConvertTime(created, ArTz);
+                    // ✅ Convertimos bien a AR (sin depender del timezone del server)
+                    var createdAr = TimeZoneInfo.ConvertTime(created, tzAr);
 
                     _queue.Enqueue(new
                     {

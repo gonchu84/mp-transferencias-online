@@ -1,7 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
-using System.Security.Claims;
 
 [ApiController]
 [Route("api/transfers")]
@@ -28,20 +27,22 @@ public class TransfersController : ControllerBase
         return cs;
     }
 
-    // ✅ GET: /api/transfers/ping (prueba rápida)
+    // ✅ GET: /api/transfers/ping
+    // Te sirve para ver que el controller está activo y ver hora AR vs UTC
     [HttpGet("ping")]
     public IActionResult Ping()
     {
-        var user = User.FindFirstValue(ClaimTypes.Name) ?? User.Identity?.Name ?? "unknown";
+        var user = User.Identity?.Name ?? "unknown";
 
-        var tz = TimeZoneInfo.FindSystemTimeZoneById("Argentina Standard Time"); // Windows
-        var nowAr = TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, tz);
+        var tz = TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires");
+        var nowUtc = DateTimeOffset.UtcNow;
+        var nowAr = TimeZoneInfo.ConvertTime(nowUtc, tz);
 
         return Ok(new
         {
             ok = true,
             user,
-            utc = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"),
+            utc = nowUtc.ToString("yyyy-MM-dd HH:mm:ss"),
             ar = nowAr.ToString("yyyy-MM-dd HH:mm:ss")
         });
     }
@@ -50,35 +51,50 @@ public class TransfersController : ControllerBase
     [HttpPost("{transferId:long}/ack")]
     public async Task<IActionResult> Ack(long transferId)
     {
-        var username = User.FindFirstValue(ClaimTypes.Name) ?? User.Identity?.Name ?? "unknown";
-
-        await using var conn = new NpgsqlConnection(GetConn());
-        await conn.OpenAsync();
-
-        // ✅ IMPORTANTE: insertamos también ack_at_utc
-        var sql = """
-        insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
-        values (
-          @transferId,
-          @username,
-          now(),
-          (now() at time zone 'America/Argentina/Buenos_Aires')::date
-        );
-        """;
+        var username = User.Identity?.Name ?? "unknown";
 
         try
         {
+            await using var conn = new NpgsqlConnection(GetConn());
+            await conn.OpenAsync();
+
+            // IMPORTANTE:
+            // Tu tabla transfer_ack (por tus capturas) tiene:
+            // - ack_at_utc (timestamp with time zone)
+            // - ack_date_ar (date)
+            // Si alguno es NOT NULL y no tiene DEFAULT, hay que insertarlo sí o sí.
+            var sql = """
+            insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
+            values (
+              @transferId,
+              @username,
+              now(), -- timestamptz (UTC en Render)
+              (now() at time zone 'America/Argentina/Buenos_Aires')::date
+            );
+            """;
+
             await using var cmd = new NpgsqlCommand(sql, conn);
             cmd.Parameters.AddWithValue("transferId", transferId);
             cmd.Parameters.AddWithValue("username", username);
 
             await cmd.ExecuteNonQueryAsync();
+
             return Ok(new { ok = true, transferId, username });
         }
         catch (PostgresException ex) when (ex.SqlState == "23505")
         {
-            // unique violation (si tenés unique por transfer_id)
+            // unique violation
             return Conflict(new { ok = false, message = "Esta transferencia ya fue aceptada por otra sucursal." });
+        }
+        catch (Exception ex)
+        {
+            // Esto te va a mostrar el error real (hoy te devuelve 500 sin info)
+            return StatusCode(500, new
+            {
+                ok = false,
+                message = "Error en ACK",
+                error = ex.Message
+            });
         }
     }
 
