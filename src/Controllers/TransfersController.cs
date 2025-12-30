@@ -4,7 +4,7 @@ using Npgsql;
 
 [ApiController]
 [Route("api/transfers")]
-[Authorize]
+[Authorize] // por defecto TODO requiere login
 public class TransfersController : ControllerBase
 {
     private readonly IConfiguration _cfg;
@@ -27,24 +27,25 @@ public class TransfersController : ControllerBase
         return cs;
     }
 
-    // ✅ GET: /api/transfers/ping  (para probar rápido que existe el controller)
+    // ✅ GET: /api/transfers/ping (SIN login) -> para probar que el controller existe y enruta bien
     [HttpGet("ping")]
+    [AllowAnonymous]
     public IActionResult Ping()
     {
-        var user = User.Identity?.Name ?? "unknown";
         return Ok(new
         {
             ok = true,
-            user,
-            timeAr = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(-3)).ToString("yyyy-MM-dd HH:mm:ss")
+            utc = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"),
+            ar = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(-3)).ToString("yyyy-MM-dd HH:mm:ss")
         });
     }
 
-    // POST: /api/transfers/{transferId}/ack
+    // ✅ POST: /api/transfers/{transferId}/ack (REQUIERE login)
     [HttpPost("{transferId:long}/ack")]
+    [Authorize]
     public async Task<IActionResult> Ack(long transferId)
     {
-        var username = User.Identity?.Name ?? "unknown";
+        var username = User?.Identity?.Name ?? "unknown";
 
         await using var conn = new NpgsqlConnection(GetConn());
         await conn.OpenAsync();
@@ -73,6 +74,43 @@ public class TransfersController : ControllerBase
         }
     }
 
+    // ✅ POST: /api/transfers/{transferId}/ack-test (SIN login) -> SOLO para probar DB y ruta
+    // Después lo borramos cuando ya esté OK el login.
+    [HttpPost("{transferId:long}/ack-test")]
+    [AllowAnonymous]
+    public async Task<IActionResult> AckTest(long transferId)
+    {
+        // podés pasar un usuario fake por query: ?u=Banfield
+        var username = Request.Query["u"].ToString();
+        if (string.IsNullOrWhiteSpace(username)) username = "test";
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+        insert into transfer_ack (transfer_id, username, ack_date_ar)
+        values (
+          @transferId,
+          @username,
+          (now() at time zone 'America/Argentina/Buenos_Aires')::date
+        );
+        """;
+
+        try
+        {
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("transferId", transferId);
+            cmd.Parameters.AddWithValue("username", username);
+
+            await cmd.ExecuteNonQueryAsync();
+            return Ok(new { ok = true, transferId, username, mode = "ack-test" });
+        }
+        catch (PostgresException ex) when (ex.SqlState == "23505")
+        {
+            return Conflict(new { ok = false, message = "Ya existe ACK para esa transferencia." });
+        }
+    }
+
     private static string ConvertPostgresUrlToConnectionString(string url)
     {
         var uri = new Uri(url);
@@ -90,7 +128,8 @@ public class TransfersController : ControllerBase
             Username = user,
             Password = pass,
             Database = db,
-            SslMode = SslMode.Require
+            SslMode = SslMode.Require,
+            TrustServerCertificate = true
         };
 
         return builder.ConnectionString;
