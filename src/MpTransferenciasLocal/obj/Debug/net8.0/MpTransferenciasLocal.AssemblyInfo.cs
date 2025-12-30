@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MpTransferenciasLocal")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+525bbce10aa6f327b80feaab321ae1e582d13f80")]
 [assembly: System.Reflection.AssemblyProductAttribute("MpTransferenciasLocal")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MpTransferenciasLocal")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
