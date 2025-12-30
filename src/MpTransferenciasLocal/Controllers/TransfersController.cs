@@ -2,10 +2,9 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
 
-namespace MpTransferenciasLocal.Controllers;
-
 [ApiController]
 [Route("api/transfers")]
+[Authorize]
 public class TransfersController : ControllerBase
 {
     private readonly IConfiguration _cfg;
@@ -28,23 +27,23 @@ public class TransfersController : ControllerBase
         return cs;
     }
 
-    // ✅ GET: /api/transfers/ping  (sin login, para probar rápido)
+    // ✅ GET: /api/transfers/ping
     [HttpGet("ping")]
-    [AllowAnonymous]
     public IActionResult Ping()
     {
+        var user = User.Identity?.Name ?? "unknown";
+        var ar = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(-3));
         return Ok(new
         {
             ok = true,
+            user,
             utc = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"),
-            ar = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(-3)).ToString("yyyy-MM-dd HH:mm:ss")
+            ar = ar.ToString("yyyy-MM-dd HH:mm:ss")
         });
     }
 
-    // POST: /api/transfers/{transferId}/ack
-    // ⚠️ Esto sí requiere login
+    // ✅ POST: /api/transfers/{transferId}/ack
     [HttpPost("{transferId:long}/ack")]
-    [Authorize]
     public async Task<IActionResult> Ack(long transferId)
     {
         var username = User.Identity?.Name ?? "unknown";
@@ -52,28 +51,41 @@ public class TransfersController : ControllerBase
         await using var conn = new NpgsqlConnection(GetConn());
         await conn.OpenAsync();
 
+        // Insert con RETURNING para saber si insertó o ya existía
         var sql = """
-        insert into transfer_ack (transfer_id, username, ack_date_ar)
+        insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
         values (
           @transferId,
           @username,
+          now(),
           (now() at time zone 'America/Argentina/Buenos_Aires')::date
-        );
+        )
+        on conflict (transfer_id) do nothing
+        returning id;
         """;
 
-        try
-        {
-            await using var cmd = new NpgsqlCommand(sql, conn);
-            cmd.Parameters.AddWithValue("transferId", transferId);
-            cmd.Parameters.AddWithValue("username", username);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("transferId", transferId);
+        cmd.Parameters.AddWithValue("username", username);
 
-            await cmd.ExecuteNonQueryAsync();
-            return Ok(new { ok = true, transferId, username });
-        }
-        catch (PostgresException ex) when (ex.SqlState == "23505")
+        var insertedId = await cmd.ExecuteScalarAsync();
+
+        if (insertedId is null)
         {
-            return Conflict(new { ok = false, message = "Esta transferencia ya fue aceptada por otra sucursal." });
+            return Conflict(new
+            {
+                ok = false,
+                message = "Esta transferencia ya fue aceptada por otra sucursal."
+            });
         }
+
+        return Ok(new
+        {
+            ok = true,
+            transferId,
+            username,
+            insertedId
+        });
     }
 
     private static string ConvertPostgresUrlToConnectionString(string url)
