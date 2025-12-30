@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
+using System.Net.Http.Headers;
 
 [ApiController]
 [Route("api/transfers")]
@@ -20,11 +21,21 @@ public class TransfersController : ControllerBase
         if (string.IsNullOrWhiteSpace(cs))
             throw new Exception("ConnectionStrings:Db vacío");
 
-        // aceptar postgres://...
         if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase))
             cs = ConvertPostgresUrlToConnectionString(cs);
 
         return cs;
+    }
+
+    private string GetMpToken()
+    {
+        // Ajustá la ruta según tu appsettings.
+        // En tus capturas tenías:
+        // "MercadoPago": { "AccessToken": "APP_USR-..." }
+        var token = _cfg["MercadoPago:AccessToken"];
+        if (string.IsNullOrWhiteSpace(token))
+            throw new Exception("MercadoPago:AccessToken vacío");
+        return token;
     }
 
     // ✅ GET: /api/transfers/ping
@@ -46,7 +57,7 @@ public class TransfersController : ControllerBase
         });
     }
 
-    // ✅ DEBUG: /api/transfers/last
+    // ✅ GET: /api/transfers/last
     [HttpGet("last")]
     public async Task<IActionResult> Last()
     {
@@ -54,10 +65,10 @@ public class TransfersController : ControllerBase
         await conn.OpenAsync();
 
         var sql = """
-        select id, mp_account_id, payment_id, fecha_utc, monto, status, payment_type
+        select id, payment_id, fecha_utc, monto, payment_type, status
         from transfers
         order by id desc
-        limit 10;
+        limit 30;
         """;
 
         await using var cmd = new NpgsqlCommand(sql, conn);
@@ -69,19 +80,92 @@ public class TransfersController : ControllerBase
             list.Add(new
             {
                 id = rd.GetInt64(0),
-                mp_account_id = rd.GetInt32(1),
-                payment_id = rd.GetString(2),
-                fecha_utc = rd.GetFieldValue<DateTimeOffset>(3),
-                monto = rd.GetDecimal(4),
-                status = rd.GetString(5),
-                payment_type = rd.GetString(6),
+                payment_id = rd.GetString(1),
+                fecha_utc = rd.GetFieldValue<DateTimeOffset>(2),
+                monto = rd.GetDecimal(3),
+                payment_type = rd.IsDBNull(4) ? null : rd.GetString(4),
+                status = rd.IsDBNull(5) ? null : rd.GetString(5),
             });
         }
 
         return Ok(new { ok = true, count = list.Count, items = list });
     }
 
-    // ✅ POST: /api/transfers/payment/{paymentId}/ack  (ACK usando payment_id de MP)
+    // ✅ DEBUG: /api/transfers/mp/me  -> confirma qué cuenta es el token
+    [HttpGet("mp/me")]
+    public async Task<IActionResult> MpMe()
+    {
+        var token = GetMpToken();
+
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var resp = await http.GetAsync("https://api.mercadopago.com/users/me");
+        var body = await resp.Content.ReadAsStringAsync();
+
+        return Ok(new
+        {
+            ok = resp.IsSuccessStatusCode,
+            status = (int)resp.StatusCode,
+            body
+        });
+    }
+
+    // ✅ DEBUG: /api/transfers/mp/payment/{paymentId}
+    [HttpGet("mp/payment/{paymentId}")]
+    public async Task<IActionResult> MpPayment(string paymentId)
+    {
+        var token = GetMpToken();
+
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var resp = await http.GetAsync($"https://api.mercadopago.com/v1/payments/{paymentId}");
+        var body = await resp.Content.ReadAsStringAsync();
+
+        return Ok(new
+        {
+            ok = resp.IsSuccessStatusCode,
+            status = (int)resp.StatusCode,
+            body
+        });
+    }
+
+    // ✅ DEBUG: /api/transfers/mp/search?minutes=1440
+    // Esto te muestra el JSON crudo que está devolviendo MP.
+    [HttpGet("mp/search")]
+    public async Task<IActionResult> MpSearch([FromQuery] int minutes = 30)
+    {
+        var token = GetMpToken();
+
+        // rango en UTC (MP suele trabajar con ISO)
+        var end = DateTimeOffset.UtcNow;
+        var begin = end.AddMinutes(-Math.Abs(minutes));
+
+        var url =
+            "https://api.mercadopago.com/v1/payments/search" +
+            "?sort=date_created&criteria=desc&limit=50" +
+            $"&range=date_created&begin_date={Uri.EscapeDataString(begin.ToString("o"))}" +
+            $"&end_date={Uri.EscapeDataString(end.ToString("o"))}";
+
+        using var http = new HttpClient();
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        var resp = await http.GetAsync(url);
+        var body = await resp.Content.ReadAsStringAsync();
+
+        return Ok(new
+        {
+            ok = resp.IsSuccessStatusCode,
+            status = (int)resp.StatusCode,
+            url,
+            begin_utc = begin.ToString("o"),
+            end_utc = end.ToString("o"),
+            body
+        });
+    }
+
+    // ✅ POST: /api/transfers/payment/{paymentId}/ack  (ACK usando payment_id)
     [HttpPost("payment/{paymentId}/ack")]
     public async Task<IActionResult> AckByPaymentId(string paymentId)
     {
@@ -92,22 +176,16 @@ public class TransfersController : ControllerBase
             await using var conn = new NpgsqlConnection(GetConn());
             await conn.OpenAsync();
 
-            // 1) buscar el ID interno (transfers.id) por payment_id
+            // 1) buscar el transfer interno por payment_id
             var findSql = "select id from transfers where payment_id = @paymentId limit 1;";
             long transferId;
 
             await using (var findCmd = new NpgsqlCommand(findSql, conn))
             {
                 findCmd.Parameters.AddWithValue("paymentId", paymentId);
-
                 var obj = await findCmd.ExecuteScalarAsync();
                 if (obj == null)
-                    return NotFound(new
-                    {
-                        ok = false,
-                        message = "No existe esa transferencia en la tabla transfers (payment_id no encontrado).",
-                        paymentId
-                    });
+                    return NotFound(new { ok = false, message = "No existe esa transferencia en la tabla transfers (payment_id no encontrado).", paymentId });
 
                 transferId = (long)obj;
             }
@@ -127,7 +205,6 @@ public class TransfersController : ControllerBase
             {
                 cmd.Parameters.AddWithValue("transferId", transferId);
                 cmd.Parameters.AddWithValue("username", username);
-
                 await cmd.ExecuteNonQueryAsync();
             }
 
@@ -169,7 +246,6 @@ public class TransfersController : ControllerBase
             cmd.Parameters.AddWithValue("username", username);
 
             await cmd.ExecuteNonQueryAsync();
-
             return Ok(new { ok = true, transferId, username });
         }
         catch (PostgresException ex) when (ex.SqlState == "23505")
