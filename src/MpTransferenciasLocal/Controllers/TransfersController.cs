@@ -29,9 +29,6 @@ public class TransfersController : ControllerBase
 
     private string GetMpToken()
     {
-        // Ajustá la ruta según tu appsettings.
-        // En tus capturas tenías:
-        // "MercadoPago": { "AccessToken": "APP_USR-..." }
         var token = _cfg["MercadoPago:AccessToken"];
         if (string.IsNullOrWhiteSpace(token))
             throw new Exception("MercadoPago:AccessToken vacío");
@@ -131,33 +128,29 @@ public class TransfersController : ControllerBase
         });
     }
 
-    // ✅ DEBUG: /api/transfers/mp/search?minutes=1440
-    // Esto te muestra el JSON crudo que está devolviendo MP.
+    // ✅ DEBUG: /api/transfers/mp/search?minutes=1440&payment_type_id=bank_transfer
+    // Devuelve JSON crudo de MP (con fechas en formato que MP acepta)
     [HttpGet("mp/search")]
-    public async Task<IActionResult> MpSearch([FromQuery] int minutes = 30)
+    public async Task<IActionResult> MpSearch([FromQuery] int minutes = 30, [FromQuery] string? payment_type_id = null)
     {
         var token = GetMpToken();
 
-        // rango en UTC (MP suele trabajar con ISO)
-   var end = DateTime.UtcNow;
-var begin = end.AddMinutes(-Math.Abs(minutes));
+        var endUtc = DateTime.UtcNow;
+        var beginUtc = endUtc.AddMinutes(-Math.Abs(minutes));
 
-// MP: usar UTC con Z y sin milisegundos
-string beginStr = begin.ToString("yyyy-MM-ddTHH:mm:ssZ");
-string endStr   = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
-
-var url =
-    "https://api.mercadopago.com/v1/payments/search" +
-    "?sort=date_created&criteria=desc&limit=50" +
-    $"&range=date_created&begin_date={Uri.EscapeDataString(beginStr)}" +
-    $"&end_date={Uri.EscapeDataString(endStr)}";
-
+        // MP: ISO UTC con Z + milisegundos (formato más compatible)
+        string beginStr = beginUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+        string endStr = endUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
 
         var url =
             "https://api.mercadopago.com/v1/payments/search" +
             "?sort=date_created&criteria=desc&limit=50" +
-            $"&range=date_created&begin_date={Uri.EscapeDataString(begin.ToString("o"))}" +
-            $"&end_date={Uri.EscapeDataString(end.ToString("o"))}";
+            "&range=date_created" +
+            $"&begin_date={Uri.EscapeDataString(beginStr)}" +
+            $"&end_date={Uri.EscapeDataString(endStr)}";
+
+        if (!string.IsNullOrWhiteSpace(payment_type_id))
+            url += $"&payment_type_id={Uri.EscapeDataString(payment_type_id)}";
 
         using var http = new HttpClient();
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
@@ -165,16 +158,15 @@ var url =
         var resp = await http.GetAsync(url);
         var body = await resp.Content.ReadAsStringAsync();
 
-     return Ok(new
-{
-    ok = resp.IsSuccessStatusCode,
-    status = (int)resp.StatusCode,
-    url,
-    begin_utc = beginStr,
-    end_utc = endStr,
-    body
-});
-
+        return Ok(new
+        {
+            ok = resp.IsSuccessStatusCode,
+            status = (int)resp.StatusCode,
+            url,
+            begin_utc = beginStr,
+            end_utc = endStr,
+            body
+        });
     }
 
     // ✅ POST: /api/transfers/payment/{paymentId}/ack  (ACK usando payment_id)
@@ -188,7 +180,6 @@ var url =
             await using var conn = new NpgsqlConnection(GetConn());
             await conn.OpenAsync();
 
-            // 1) buscar el transfer interno por payment_id
             var findSql = "select id from transfers where payment_id = @paymentId limit 1;";
             long transferId;
 
@@ -197,12 +188,16 @@ var url =
                 findCmd.Parameters.AddWithValue("paymentId", paymentId);
                 var obj = await findCmd.ExecuteScalarAsync();
                 if (obj == null)
-                    return NotFound(new { ok = false, message = "No existe esa transferencia en la tabla transfers (payment_id no encontrado).", paymentId });
+                    return NotFound(new
+                    {
+                        ok = false,
+                        message = "No existe esa transferencia en la tabla transfers (payment_id no encontrado).",
+                        paymentId
+                    });
 
                 transferId = (long)obj;
             }
 
-            // 2) insertar ACK
             var insertSql = """
             insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
             values (
@@ -287,8 +282,7 @@ var url =
             Username = user,
             Password = pass,
             Database = db,
-            SslMode = SslMode.Require,
-            TrustServerCertificate = true
+            SslMode = SslMode.Require
         };
 
         return builder.ConnectionString;
