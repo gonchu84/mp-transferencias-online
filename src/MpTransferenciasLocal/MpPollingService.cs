@@ -9,7 +9,8 @@ class MpPollingService : BackgroundService
     private readonly IConfiguration _cfg;
     private readonly ConcurrentQueue<object> _queue;
 
-    private static readonly TimeZoneInfo ArTz = GetArgentinaTimeZone();
+    // ✅ Timezone AR (Render suele estar en UTC)
+    private static readonly TimeZoneInfo ArTz = TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires");
 
     public MpPollingService(
         IHttpClientFactory http,
@@ -33,9 +34,6 @@ class MpPollingService : BackgroundService
         }
 
         var seconds = int.TryParse(_cfg["Polling:Seconds"], out var s) ? s : 10;
-
-        // OJO: MP devuelve los últimos 20 ordenados desc.
-        // lastSeen guarda el más “nuevo” que ya procesamos.
         DateTimeOffset? lastSeen = null;
 
         while (!stoppingToken.IsCancellationRequested)
@@ -50,40 +48,37 @@ class MpPollingService : BackgroundService
                     "v1/payments/search?sort=date_created&criteria=desc&limit=20",
                     stoppingToken);
 
-                var json = await resp.Content.ReadAsStringAsync(stoppingToken);
-                using var doc = JsonDocument.Parse(json);
+                // Si MP responde no-200, logueamos el body para ver el motivo
+                if (!resp.IsSuccessStatusCode)
+                {
+                    var bodyErr = await resp.Content.ReadAsStringAsync(stoppingToken);
+                    _queue.Enqueue(new { cuenta, error = $"MP {(int)resp.StatusCode}: {bodyErr}" });
+                    await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
+                    continue;
+                }
 
-                if (!doc.RootElement.TryGetProperty("results", out var results))
-                    goto Sleep;
+                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(stoppingToken));
+                if (!doc.RootElement.TryGetProperty("results", out var results)) continue;
 
                 foreach (var item in results.EnumerateArray())
                 {
-                    // MP suele mandar ISO con offset. Esto queda perfecto en DateTimeOffset.
                     var created = item.GetProperty("date_created").GetDateTimeOffset();
 
-                    // Como viene desc, el primero es el más nuevo.
                     if (lastSeen != null && created <= lastSeen) continue;
+                    lastSeen = created;
 
-                    // Convertimos a hora Argentina SIEMPRE (Render está en UTC)
+                    // ✅ Convertimos a hora AR SIEMPRE
                     var createdAr = TimeZoneInfo.ConvertTime(created, ArTz);
 
                     _queue.Enqueue(new
                     {
                         cuenta,
                         id = item.GetProperty("id").ToString(),
-
-                        // te dejo ambas por si después querés agrupar por día AR
-                        fecha_utc = created.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss"),
-                        fecha_ar = createdAr.ToString("yyyy-MM-dd HH:mm:ss"),
-
+                        fecha = createdAr.ToString("yyyy-MM-dd HH:mm:ss"),
                         monto = item.GetProperty("transaction_amount").GetDecimal(),
-                        status = item.TryGetProperty("status", out var st) ? st.GetString() : null,
-                        payment_type_id = item.TryGetProperty("payment_type_id", out var pt) ? pt.GetString() : null,
-                        json_raw = json // opcional, si querés debug (si te molesta, lo sacamos)
+                        status = item.GetProperty("status").GetString(),
+                        payment_type_id = item.GetProperty("payment_type_id").GetString()
                     });
-
-                    // actualizamos lastSeen al más nuevo procesado
-                    if (lastSeen == null || created > lastSeen) lastSeen = created;
                 }
             }
             catch (Exception ex)
@@ -91,22 +86,7 @@ class MpPollingService : BackgroundService
                 _queue.Enqueue(new { cuenta, error = ex.Message });
             }
 
-        Sleep:
             await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
         }
-    }
-
-    private static TimeZoneInfo GetArgentinaTimeZone()
-    {
-        // Linux (Render): "America/Argentina/Buenos_Aires"
-        try { return TimeZoneInfo.FindSystemTimeZoneById("America/Argentina/Buenos_Aires"); }
-        catch { /* ignore */ }
-
-        // Windows: "Argentina Standard Time"
-        try { return TimeZoneInfo.FindSystemTimeZoneById("Argentina Standard Time"); }
-        catch { /* ignore */ }
-
-        // Fallback: UTC (no debería pasar)
-        return TimeZoneInfo.Utc;
     }
 }

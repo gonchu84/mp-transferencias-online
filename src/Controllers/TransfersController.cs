@@ -1,4 +1,3 @@
-using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Npgsql;
@@ -28,72 +27,50 @@ public class TransfersController : ControllerBase
         return cs;
     }
 
-    private string GetUsername()
+    // ✅ GET: /api/transfers/ping  (para probar rápido que existe el controller)
+    [HttpGet("ping")]
+    public IActionResult Ping()
     {
-        // 1) Lo más confiable cuando hay auth por cookies o claims
-        var claimName = User.FindFirstValue(ClaimTypes.Name);
-        if (!string.IsNullOrWhiteSpace(claimName))
-            return claimName;
-
-        // 2) Fallback
-        var idName = User.Identity?.Name;
-        if (!string.IsNullOrWhiteSpace(idName))
-            return idName;
-
-        return "unknown";
+        var user = User.Identity?.Name ?? "unknown";
+        return Ok(new
+        {
+            ok = true,
+            user,
+            timeAr = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(-3)).ToString("yyyy-MM-dd HH:mm:ss")
+        });
     }
 
     // POST: /api/transfers/{transferId}/ack
     [HttpPost("{transferId:long}/ack")]
     public async Task<IActionResult> Ack(long transferId)
     {
-        var username = GetUsername();
+        var username = User.Identity?.Name ?? "unknown";
 
         await using var conn = new NpgsqlConnection(GetConn());
         await conn.OpenAsync();
 
-        // Reglas:
-        // - Si ya existe ACK para ese transfer_id por el mismo usuario => OK (idempotente)
-        // - Si ya existe ACK para ese transfer_id por otro usuario => 409 Conflict
-        // - Si no existe => inserta
         var sql = """
         insert into transfer_ack (transfer_id, username, ack_date_ar)
         values (
           @transferId,
           @username,
           (now() at time zone 'America/Argentina/Buenos_Aires')::date
-        )
-        on conflict (transfer_id) do nothing;
-
-        select username
-        from transfer_ack
-        where transfer_id = @transferId
-        limit 1;
+        );
         """;
 
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("transferId", transferId);
-        cmd.Parameters.AddWithValue("username", username);
-
-        // Ejecutamos y leemos quién quedó como dueño del ACK
-        var ackOwnerObj = await cmd.ExecuteScalarAsync();
-        var ackOwner = ackOwnerObj?.ToString() ?? "";
-
-        if (string.IsNullOrWhiteSpace(ackOwner))
-            return StatusCode(500, new { ok = false, message = "No se pudo confirmar el ACK." });
-
-        if (!string.Equals(ackOwner, username, StringComparison.OrdinalIgnoreCase))
+        try
         {
-            return Conflict(new
-            {
-                ok = false,
-                message = "Esta transferencia ya fue aceptada por otra sucursal.",
-                acceptedBy = ackOwner
-            });
-        }
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("transferId", transferId);
+            cmd.Parameters.AddWithValue("username", username);
 
-        // OK: o la insertó recién, o ya era suya
-        return Ok(new { ok = true, transferId, username });
+            await cmd.ExecuteNonQueryAsync();
+            return Ok(new { ok = true, transferId, username });
+        }
+        catch (PostgresException ex) when (ex.SqlState == "23505")
+        {
+            return Conflict(new { ok = false, message = "Esta transferencia ya fue aceptada por otra sucursal." });
+        }
     }
 
     private static string ConvertPostgresUrlToConnectionString(string url)
@@ -113,8 +90,7 @@ public class TransfersController : ControllerBase
             Username = user,
             Password = pass,
             Database = db,
-            SslMode = SslMode.Require,
-            TrustServerCertificate = true
+            SslMode = SslMode.Require
         };
 
         return builder.ConnectionString;
