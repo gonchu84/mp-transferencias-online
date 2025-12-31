@@ -151,6 +151,46 @@ app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.No
 // ✅ Controllers /api/transfers/...
 app.MapControllers();
 
+static string NormalizeConnString(IConfiguration cfg)
+{
+    var cs = cfg.GetConnectionString("Db") ?? "";
+
+    // En Render suele venir así
+    if (string.IsNullOrWhiteSpace(cs))
+        cs = cfg["DATABASE_URL"] ?? "";
+
+    if (string.IsNullOrWhiteSpace(cs))
+        throw new Exception("No se encontró ConnectionStrings:Db ni DATABASE_URL");
+
+    cs = cs.Trim().Trim('"');
+
+    if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+        cs.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+    {
+        var uri = new Uri(cs);
+
+        var userInfo = uri.UserInfo.Split(':', 2);
+        var user = Uri.UnescapeDataString(userInfo[0]);
+        var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
+
+        var db = uri.AbsolutePath.TrimStart('/');
+
+        var b = new Npgsql.NpgsqlConnectionStringBuilder
+        {
+            Host = uri.Host,
+            Port = uri.Port > 0 ? uri.Port : 5432,
+            Username = user,
+            Password = pass,
+            Database = db,
+            SslMode = Npgsql.SslMode.Require
+        };
+
+        return b.ConnectionString;
+    }
+
+    return cs;
+}
+
 
 // ✅ HOME: LEE DESDE DB (Opción A)
 app.MapGet("/", async (HttpContext ctx, IConfiguration cfg) =>
@@ -164,7 +204,7 @@ app.MapGet("/", async (HttpContext ctx, IConfiguration cfg) =>
     var ar = CultureInfo.GetCultureInfo("es-AR");
     var tzAr = TimeZoneInfo.CreateCustomTimeZone("AR", TimeSpan.FromHours(-3), "AR", "AR");
 
-    var connStr = cfg.GetConnectionString("Db");
+    var connStr = NormalizeConnString(cfg);
     if (string.IsNullOrWhiteSpace(connStr))
         return Results.Content("<h2>ERROR: No hay ConnectionStrings:Db</h2>", "text/html; charset=utf-8");
 
