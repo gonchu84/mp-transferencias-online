@@ -153,7 +153,7 @@ app.MapControllers();
 
 
 // ✅ HOME: LEE DESDE DB (Opción A)
-app.MapGet("/", [Authorize] async (IConfiguration cfg) =>
+app.MapGet("/", async (HttpContext ctx, IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
     var alias = cfg["Alias"] ?? "";
