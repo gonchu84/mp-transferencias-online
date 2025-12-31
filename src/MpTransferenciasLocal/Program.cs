@@ -209,7 +209,7 @@ app.MapGet("/", async (HttpContext ctx, IConfiguration cfg) =>
         return Results.Content("<h2>ERROR: No hay ConnectionStrings:Db</h2>", "text/html; charset=utf-8");
 
     // últimos 5 minutos (igual que tu UI) y tope 50
-    var desdeUtc = DateTimeOffset.UtcNow.AddMinutes(-5);
+    //var desdeUtc = DateTimeOffset.UtcNow.AddMinutes(-5);
 
     var rowsHtml = new StringBuilder();
 
@@ -219,14 +219,13 @@ app.MapGet("/", async (HttpContext ctx, IConfiguration cfg) =>
 
         var sql = @"
             select id, payment_id, fecha_utc, monto, status, payment_type
-            from transfers
-            where fecha_utc >= @desde
-            order by fecha_utc desc
-            limit 50;
+from transfers
+order by id desc
+limit 20;
         ";
 
         await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("desde", desdeUtc);
+        //cmd.Parameters.AddWithValue("desde", desdeUtc);
 
         await using var rd = await cmd.ExecuteReaderAsync();
 
