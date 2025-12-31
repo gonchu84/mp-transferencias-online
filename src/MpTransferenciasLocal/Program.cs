@@ -55,6 +55,10 @@ builder.Services.AddHttpClient("MP", c =>
 
 builder.Services.AddSingleton<ConcurrentQueue<object>>();
 builder.Services.AddHostedService<MpPollingService>();
+builder.Services.AddHttpClient("MP", c =>
+{
+    c.BaseAddress = new Uri("https://api.mercadopago.com/");
+});
 
 // ✅ Controllers para /api/transfers/*
 builder.Services.AddControllers();
