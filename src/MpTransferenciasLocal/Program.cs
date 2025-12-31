@@ -1,9 +1,9 @@
-using System.Collections.Concurrent;
 using System.Globalization;
-using System.Net.Http.Headers;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Authorization;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -12,7 +12,6 @@ var port = Environment.GetEnvironmentVariable("PORT") ?? "5286";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // ================= CONFIG =================
-//
 // OJO: CreateBuilder() YA agrega appsettings + env vars.
 // Si volvemos a agregar JSON después, podemos pisar env vars.
 // Entonces: agregamos SOLO el appsettings.Sucursal.json y
@@ -46,25 +45,15 @@ builder.Configuration.AddEnvironmentVariables();
 
 // ================= SERVICES =================
 builder.Services.AddControllers();
-
-
-builder.Services.AddHttpClient("MP", c =>
-{
-    c.BaseAddress = new Uri("https://api.mercadopago.com/");
-});
-
-builder.Services.AddSingleton<ConcurrentQueue<object>>();
-builder.Services.AddHostedService<MpPollingService>();
-builder.Services.AddHttpClient("MP", c =>
-{
-    c.BaseAddress = new Uri("https://api.mercadopago.com/");
-});
-
-// ✅ Controllers para /api/transfers/*
-builder.Services.AddControllers();
-
-// ✅ Authorization para que [Authorize] funcione con ctx.User seteado
 builder.Services.AddAuthorization();
+
+builder.Services.AddHttpClient("MP", c =>
+{
+    c.BaseAddress = new Uri("https://api.mercadopago.com/");
+});
+
+// tu polling sigue igual (solo lo dejé registrado 1 vez)
+builder.Services.AddHostedService<MpPollingService>();
 
 // ================= HELPERS (TOP-LEVEL SAFE) =================
 bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
@@ -117,7 +106,6 @@ if (authUsers.Count > 0)
             return;
         }
 
-        // ✅ leer header de forma segura
         var authHeader = ctx.Request.Headers["Authorization"].ToString();
 
         if (TryGetBasicCredentials(authHeader, out var user, out var pass))
@@ -142,7 +130,6 @@ if (authUsers.Count > 0)
     });
 }
 
-// ✅ Authorization middleware (necesario para [Authorize])
 app.UseAuthorization();
 
 // ================= LOG =================
@@ -161,85 +148,77 @@ Console.WriteLine("========================================");
 // ================= ENDPOINTS =================
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
 
-app.MapGet("/api/transferencias", (ConcurrentQueue<object> q) => Results.Ok(q.ToArray()));
-
-// ✅ Mapea controllers (/api/transfers/...)
+// ✅ Controllers /api/transfers/...
 app.MapControllers();
 
-using Npgsql;
-using System.Globalization;
-using System.Text.Json;
 
-app.MapGet("/", async (IConfiguration cfg) =>
+// ✅ HOME: LEE DESDE DB (Opción A)
+app.MapGet("/", [Authorize] async (IConfiguration cfg) =>
 {
-    var cuenta = cfg["Cuenta"] ?? "Cuenta";
+    var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
     var alias = cfg["Alias"] ?? "";
     var cvu = cfg["CVU"] ?? "";
 
+    var ar = CultureInfo.GetCultureInfo("es-AR");
+    var tzAr = TimeZoneInfo.CreateCustomTimeZone("AR", TimeSpan.FromHours(-3), "AR", "AR");
+
     var connStr = cfg.GetConnectionString("Db");
     if (string.IsNullOrWhiteSpace(connStr))
-        return Results.Content("<h3>Falta ConnectionStrings:Db</h3>", "text/html; charset=utf-8");
+        return Results.Content("<h2>ERROR: No hay ConnectionStrings:Db</h2>", "text/html; charset=utf-8");
 
-    var minutes = 5;        // lo que muestra tu UI
-    var limit = 50;         // lo que querés mostrar en tabla
+    // últimos 5 minutos (igual que tu UI) y tope 50
+    var desdeUtc = DateTimeOffset.UtcNow.AddMinutes(-5);
 
-    var ar = CultureInfo.GetCultureInfo("es-AR");
-
-    // Trae últimos X minutos desde DB
-    var rowsData = new List<(DateTimeOffset fechaUtc, decimal monto, string medio, string status, string paymentId)>();
+    var rowsHtml = new StringBuilder();
 
     await using (var conn = new NpgsqlConnection(connStr))
     {
         await conn.OpenAsync();
 
         var sql = @"
-            select fecha_utc, monto, payment_type, status, payment_id
+            select id, payment_id, fecha_utc, monto, status, payment_type
             from transfers
-            where fecha_utc >= (now() at time zone 'utc') - make_interval(mins => @mins)
+            where fecha_utc >= @desde
             order by fecha_utc desc
-            limit @lim;
+            limit 50;
         ";
 
         await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("mins", minutes);
-        cmd.Parameters.AddWithValue("lim", limit);
+        cmd.Parameters.AddWithValue("desde", desdeUtc);
 
         await using var rd = await cmd.ExecuteReaderAsync();
+
+        bool any = false;
+
         while (await rd.ReadAsync())
         {
-            // fecha_utc es timestamptz (timestamp with time zone)
-            var fecha = rd.GetFieldValue<DateTimeOffset>(0);
-            var monto = rd.GetDecimal(1);
-            var medio = rd.GetString(2);
-            var status = rd.GetString(3);
-            var paymentId = rd.GetString(4);
+            any = true;
 
-            rowsData.Add((fecha, monto, medio, status, paymentId));
+            var fechaUtc = rd.GetFieldValue<DateTimeOffset>(rd.GetOrdinal("fecha_utc"));
+            // mostrar AR (-03)
+            var fechaAr = TimeZoneInfo.ConvertTime(fechaUtc, tzAr);
+
+            var monto = rd.GetDecimal(rd.GetOrdinal("monto"));
+            var status = rd.GetString(rd.GetOrdinal("status"));
+            var medio = rd.GetString(rd.GetOrdinal("payment_type"));
+            var paymentId = rd.GetString(rd.GetOrdinal("payment_id"));
+
+            var pillClass = (status == "approved" || status == "accredited") ? "ok" : "bad";
+
+            rowsHtml.Append("<tr>");
+            rowsHtml.Append("<td class='mono'>").Append(fechaAr.ToString("dd/MM HH:mm:ss")).Append("</td>");
+            rowsHtml.Append("<td class='money'>").Append(monto.ToString("C", ar)).Append("</td>");
+            rowsHtml.Append("<td>").Append(medio).Append("</td>");
+            rowsHtml.Append("<td><span class='pill ").Append(pillClass).Append("'>").Append(status).Append("</span></td>");
+            rowsHtml.Append("<td class='muted mono'>").Append(paymentId).Append("</td>");
+            rowsHtml.Append("</tr>");
+        }
+
+        if (!any)
+        {
+            rowsHtml.Append("<tr><td colspan='5'><div class='errorBox'>No hay movimientos en los últimos 5 minutos.</div></td></tr>");
         }
     }
-
-    string RenderRow((DateTimeOffset fechaUtc, decimal monto, string medio, string status, string paymentId) x)
-    {
-        // Para mostrar lindo en Argentina: convertimos a hora local (-03)
-        var fechaLocal = x.fechaUtc.ToOffset(TimeSpan.FromHours(-3));
-        var fechaTxt = fechaLocal.ToString("dd/MM/yyyy HH:mm:ss");
-
-        var montoTxt = x.monto.ToString("C", ar);
-        var pillClass = (x.status == "approved" || x.status == "accredited") ? "ok" : "bad";
-
-        return
-            "<tr>" +
-            "<td class='mono'>" + fechaTxt + "</td>" +
-            "<td class='money'>" + montoTxt + "</td>" +
-            "<td>" + x.medio + "</td>" +
-            "<td><span class='pill " + pillClass + "'>" + x.status + "</span></td>" +
-            "<td class='muted mono'>" + x.paymentId + "</td>" +
-            "</tr>";
-    }
-
-    var rows = rowsData.Count == 0
-        ? "<tr><td colspan='5' class='muted'>Sin movimientos en los últimos " + minutes + " minutos.</td></tr>"
-        : string.Join("", rowsData.Select(RenderRow));
 
     var showAccountBox = !(string.IsNullOrWhiteSpace(alias) && string.IsNullOrWhiteSpace(cvu));
     var accountBoxHtml = showAccountBox
@@ -333,6 +312,12 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 .ok{background:rgba(34,197,94,.18);color:#bbf7d0}
 .bad{background:rgba(239,68,68,.18);color:#fecaca}
 .muted{color:var(--muted)}
+.errorBox{
+  padding:12px 14px;border-radius:12px;
+  border:1px solid rgba(239,68,68,.35);
+  background:rgba(239,68,68,.08);color:#fecaca;
+  font-size:14px;
+}
 .footer{
   position:fixed;bottom:0;left:0;right:0;padding:12px 14px;text-align:center;
   color:rgba(148,163,184,.85);font-size:12px;
@@ -353,7 +338,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
     <div class='header'>
       <div class='titleRow'>
         <h1>MP Transferencias · %%CUENTA%%</h1>
-        <div class='sub'>Últimos <b>%%MINUTES%% minutos</b> · Actualiza cada 8 segundos</div>
+        <div class='sub'>Últimos <b>5 minutos</b> · Actualiza cada 8 segundos</div>
       </div>
       %%ACCOUNT_BOX%%
     </div>
@@ -384,12 +369,10 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 
     var html = htmlTemplate
         .Replace("%%CUENTA%%", cuenta)
-        .Replace("%%MINUTES%%", minutes.ToString())
         .Replace("%%ACCOUNT_BOX%%", accountBoxHtml)
-        .Replace("%%ROWS%%", rows);
+        .Replace("%%ROWS%%", rowsHtml.ToString());
 
     return Results.Content(html, "text/html; charset=utf-8");
 });
-app.MapControllers();
 
 app.Run();
