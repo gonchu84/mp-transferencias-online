@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using Microsoft.Extensions.Hosting;
@@ -22,131 +23,117 @@ public class MpPollingService : BackgroundService
         var token = _cfg["MercadoPago:AccessToken"];
         if (string.IsNullOrWhiteSpace(token))
         {
-            _log.LogWarning("MercadoPago:AccessToken vacío. MpPollingService no inicia.");
+            _log.LogWarning("MP Polling: MercadoPago:AccessToken vacío. No arranca.");
             return;
         }
 
         var seconds = int.TryParse(_cfg["Polling:Seconds"], out var s) ? s : 10;
-        if (seconds < 5) seconds = 5;
-
-        _log.LogInformation("MpPollingService iniciado. Intervalo: {Seconds}s", seconds);
+        var minutes = int.TryParse(_cfg["Polling:Minutes"], out var m) ? m : 10; // ventana de búsqueda
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                // Ventana: últimos N minutos (un poco más grande para no perder nada)
-                var minutes = 120;
-
+                // 1) Armo rango UTC bien formateado (ISO 8601 con Z)
                 var endUtc = DateTimeOffset.UtcNow;
                 var beginUtc = endUtc.AddMinutes(-minutes);
 
-                // MP es MUY sensible al formato de fechas:
-                // usar ISO con Z (UTC) y milisegundos opcionales
-                string begin = beginUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
-                string end = endUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
+                string begin = beginUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+                string end = endUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
 
+                // 2) Endpoint (sin filtrar por payment_type_id por ahora)
                 var url =
-                    $"v1/payments/search" +
-                    $"?sort=date_created&criteria=desc&limit=50" +
-                    $"&range=date_created" +
-                    $"&begin_date={Uri.EscapeDataString(begin)}" +
-                    $"&end_date={Uri.EscapeDataString(end)}";
+                    $"v1/payments/search?sort=date_created&criteria=desc&limit=50" +
+                    $"&range=date_created&begin_date={Uri.EscapeDataString(begin)}&end_date={Uri.EscapeDataString(end)}";
 
                 var client = _http.CreateClient("MP");
-                client.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", token);
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
                 var resp = await client.GetAsync(url, stoppingToken);
-                var bodyText = await resp.Content.ReadAsStringAsync(stoppingToken);
+                var raw = await resp.Content.ReadAsStringAsync(stoppingToken);
 
                 if (!resp.IsSuccessStatusCode)
                 {
-                    _log.LogWarning("MP search error {Status}. Body: {Body}", (int)resp.StatusCode, bodyText);
+                    _log.LogError("MP Polling: HTTP {Status}. Body: {Body}", (int)resp.StatusCode, raw);
                     await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
                     continue;
                 }
 
-                using var doc = JsonDocument.Parse(bodyText);
+                using var doc = JsonDocument.Parse(raw);
 
                 if (!doc.RootElement.TryGetProperty("results", out var results) || results.ValueKind != JsonValueKind.Array)
                 {
-                    _log.LogWarning("MP search: no vino 'results' array.");
+                    _log.LogWarning("MP Polling: no vino 'results' array. Raw: {Raw}", raw);
                     await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
                     continue;
                 }
 
-                // Conexión DB (soporta postgres://)
-                await using var conn = new NpgsqlConnection(GetConn());
+                var count = results.GetArrayLength();
+                _log.LogInformation("MP Polling: OK. results={Count} (begin={Begin} end={End})", count, begin, end);
+
+                // 3) Guardo en DB (conversión de postgres:// incluida, igual que tu controller)
+                await using var conn = new NpgsqlConnection(GetConnString());
                 await conn.OpenAsync(stoppingToken);
 
-                var inserted = 0;
                 foreach (var item in results.EnumerateArray())
                 {
-                    // Solo nos interesan transferencias:
-                    // En MP suelen venir como payment_type_id = bank_transfer
-                    // PERO para no perder nada, guardamos todo y filtrás en UI si querés.
-                    var mpId = item.GetProperty("id").GetInt64();
+                    // id de MP (lo guardás como text en payment_id)
+                    var mpPaymentId = item.GetProperty("id").ToString(); // seguro
 
-                    var dateCreated = item.TryGetProperty("date_created", out var dc)
-                        ? dc.GetDateTimeOffset().ToUniversalTime()
-                        : DateTimeOffset.UtcNow;
+                    // fecha
+                    DateTimeOffset fechaUtc = default;
+                    if (item.TryGetProperty("date_created", out var dc) && dc.ValueKind == JsonValueKind.String)
+                        fechaUtc = DateTimeOffset.Parse(dc.GetString()!, CultureInfo.InvariantCulture);
 
-                    var amount = item.TryGetProperty("transaction_amount", out var ta)
-                        ? ta.GetDecimal()
-                        : 0m;
+                    // monto
+                    decimal monto = 0;
+                    if (item.TryGetProperty("transaction_amount", out var ta) && ta.ValueKind == JsonValueKind.Number)
+                        monto = ta.GetDecimal();
 
-                    var status = item.TryGetProperty("status", out var st)
-                        ? (st.GetString() ?? "")
-                        : "";
+                    // status
+                    var status = item.TryGetProperty("status", out var st) ? (st.GetString() ?? "") : "";
 
-                    var paymentTypeId = item.TryGetProperty("payment_type_id", out var pti)
-                        ? (pti.GetString() ?? "")
-                        : "";
+                    // payment_type_id (ojo: puede ser account_money, bank_transfer, etc.)
+                    var paymentType = item.TryGetProperty("payment_type_id", out var pt) ? (pt.GetString() ?? "") : "";
 
-                    var paymentMethodId = item.TryGetProperty("payment_method_id", out var pmi)
-                        ? (pmi.GetString() ?? "")
-                        : "";
-
-                    var paymentType = string.IsNullOrWhiteSpace(paymentMethodId)
-                        ? paymentTypeId
-                        : $"{paymentTypeId}/{paymentMethodId}";
-
-                    var rawJson = item.GetRawText();
+                    // json_raw
+                    var jsonRaw = item.GetRawText();
 
                     var sql = """
-                        insert into transfers
-                        (mp_payment_id, payment_id, fecha_utc, monto, status, payment_type, json_raw)
-                        values
-                        (@mpId, @paymentId, @fechaUtc, @monto, @status, @paymentType, @json::jsonb)
-                        on conflict (mp_payment_id) do nothing;
+                    insert into transfers
+                    (mp_account_id, payment_id, fecha_utc, monto, status, payment_type, json_raw)
+                    values
+                    (@mp_account_id, @payment_id, @fecha_utc, @monto, @status, @payment_type, @json_raw::jsonb)
+                    on conflict (payment_id) do update set
+                        fecha_utc = excluded.fecha_utc,
+                        monto = excluded.monto,
+                        status = excluded.status,
+                        payment_type = excluded.payment_type,
+                        json_raw = excluded.json_raw;
                     """;
 
                     await using var cmd = new NpgsqlCommand(sql, conn);
-                    cmd.Parameters.AddWithValue("mpId", mpId);
-                    cmd.Parameters.AddWithValue("paymentId", mpId.ToString());  // compat (tu controller busca por payment_id)
-                    cmd.Parameters.AddWithValue("fechaUtc", dateCreated);
-                    cmd.Parameters.AddWithValue("monto", amount);
+                    cmd.Parameters.AddWithValue("mp_account_id", int.TryParse(_cfg["MpAccountId"], out var acc) ? acc : 0);
+                    cmd.Parameters.AddWithValue("payment_id", mpPaymentId);
+                    cmd.Parameters.AddWithValue("fecha_utc", fechaUtc == default ? (object)DBNull.Value : fechaUtc);
+                    cmd.Parameters.AddWithValue("monto", monto);
                     cmd.Parameters.AddWithValue("status", status);
-                    cmd.Parameters.AddWithValue("paymentType", paymentType);
-                    cmd.Parameters.AddWithValue("json", rawJson);
+                    cmd.Parameters.AddWithValue("payment_type", paymentType);
+                    cmd.Parameters.AddWithValue("json_raw", jsonRaw);
 
-                    var rows = await cmd.ExecuteNonQueryAsync(stoppingToken);
-                    if (rows > 0) inserted += rows;
+                    await cmd.ExecuteNonQueryAsync(stoppingToken);
                 }
-
-                _log.LogInformation("MP polling OK. results={Count}, inserted={Inserted}", results.GetArrayLength(), inserted);
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "Error en MpPollingService");
+                _log.LogError(ex, "MP Polling: EXCEPTION");
             }
 
             await Task.Delay(TimeSpan.FromSeconds(seconds), stoppingToken);
         }
     }
 
-    private string GetConn()
+    private string GetConnString()
     {
         var cs = _cfg.GetConnectionString("Db");
         if (string.IsNullOrWhiteSpace(cs))
@@ -161,11 +148,9 @@ public class MpPollingService : BackgroundService
     private static string ConvertPostgresUrlToConnectionString(string url)
     {
         var uri = new Uri(url);
-
         var userInfo = uri.UserInfo.Split(':', 2);
         var user = Uri.UnescapeDataString(userInfo[0]);
         var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
-
         var db = uri.AbsolutePath.TrimStart('/');
 
         var builder = new NpgsqlConnectionStringBuilder
