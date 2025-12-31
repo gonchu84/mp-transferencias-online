@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Security.Claims;
 using System.Text;
-using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Npgsql;
 
@@ -12,10 +11,6 @@ var port = Environment.GetEnvironmentVariable("PORT") ?? "5286";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // ================= CONFIG =================
-// OJO: CreateBuilder() YA agrega appsettings + env vars.
-// Si volvemos a agregar JSON después, podemos pisar env vars.
-// Entonces: agregamos SOLO el appsettings.Sucursal.json y
-// volvemos a agregar EnvironmentVariables AL FINAL para que ganen.
 var configFromExe = Path.Combine(AppContext.BaseDirectory, "config", "appsettings.Sucursal.json");
 var configFromDev = Path.GetFullPath(
     Path.Combine(builder.Environment.ContentRootPath, "..", "..", "config", "appsettings.Sucursal.json")
@@ -52,10 +47,10 @@ builder.Services.AddHttpClient("MP", c =>
     c.BaseAddress = new Uri("https://api.mercadopago.com/");
 });
 
-// tu polling sigue igual (solo lo dejé registrado 1 vez)
+// Polling
 builder.Services.AddHostedService<MpPollingService>();
 
-// ================= HELPERS (TOP-LEVEL SAFE) =================
+// ================= HELPERS =================
 bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
 {
     user = string.Empty;
@@ -86,11 +81,62 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
     }
 }
 
+// 🔧 Normaliza ConnectionString (Render postgres:// o DATABASE_URL)
+static string NormalizeConnString(IConfiguration cfg)
+{
+    var cs = cfg.GetConnectionString("Db") ?? "";
+
+    if (string.IsNullOrWhiteSpace(cs))
+        cs = cfg["DATABASE_URL"] ?? "";
+
+    if (string.IsNullOrWhiteSpace(cs))
+        throw new Exception("No se encontró ConnectionStrings:Db ni DATABASE_URL");
+
+    cs = cs.Trim().Trim('"');
+
+    if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+        cs.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+    {
+        var uri = new Uri(cs);
+
+        var userInfo = uri.UserInfo.Split(':', 2);
+        var user = Uri.UnescapeDataString(userInfo[0]);
+        var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
+
+        var db = uri.AbsolutePath.TrimStart('/');
+
+        var b = new NpgsqlConnectionStringBuilder
+        {
+            Host = uri.Host,
+            Port = uri.Port > 0 ? uri.Port : 5432,
+            Username = user,
+            Password = pass,
+            Database = db,
+            SslMode = SslMode.Require
+        };
+
+        return b.ConnectionString;
+    }
+
+    return cs;
+}
+
 var app = builder.Build();
 
 // ================= DB INIT =================
+// OJO: si DbBootstrap/DbSeed internamente usan GetConnectionString("Db"),
+// es mejor que ellos también normalicen. Acá al menos aseguramos que DbSeed reciba algo válido.
 await DbBootstrap.EnsureCreatedAsync(app.Configuration);
-await DbSeed.SeedAsync(app.Configuration.GetConnectionString("Db")!);
+
+try
+{
+    var cs = NormalizeConnString(app.Configuration);
+    await DbSeed.SeedAsync(cs);
+}
+catch (Exception ex)
+{
+    Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
+}
 
 // ================= AUTH (Basic) =================
 var authUsers = AuthHelpers.LoadAuthUsers(app.Configuration);
@@ -99,7 +145,6 @@ if (authUsers.Count > 0)
 {
     app.Use(async (ctx, next) =>
     {
-        // Health sin auth (para monitoreo del host)
         if (ctx.Request.Path.StartsWithSegments("/health"))
         {
             await next();
@@ -148,118 +193,14 @@ Console.WriteLine("========================================");
 // ================= ENDPOINTS =================
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
 
-// ✅ Controllers /api/transfers/...
 app.MapControllers();
 
-static string NormalizeConnString(IConfiguration cfg)
+// ✅ HOME (Pendientes + Aceptadas hoy)
+app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 {
-    var cs = cfg.GetConnectionString("Db") ?? "";
-
-    // En Render suele venir así
-    if (string.IsNullOrWhiteSpace(cs))
-        cs = cfg["DATABASE_URL"] ?? "";
-
-    if (string.IsNullOrWhiteSpace(cs))
-        throw new Exception("No se encontró ConnectionStrings:Db ni DATABASE_URL");
-
-    cs = cs.Trim().Trim('"');
-
-    if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
-        cs.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
-    {
-        var uri = new Uri(cs);
-
-        var userInfo = uri.UserInfo.Split(':', 2);
-        var user = Uri.UnescapeDataString(userInfo[0]);
-        var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
-
-        var db = uri.AbsolutePath.TrimStart('/');
-
-        var b = new Npgsql.NpgsqlConnectionStringBuilder
-        {
-            Host = uri.Host,
-            Port = uri.Port > 0 ? uri.Port : 5432,
-            Username = user,
-            Password = pass,
-            Database = db,
-            SslMode = Npgsql.SslMode.Require
-        };
-
-        return b.ConnectionString;
-    }
-
-    return cs;
-}
-
-
-// ✅ HOME: LEE DESDE DB (Opción A)
-app.MapGet("/", async (HttpContext ctx, IConfiguration cfg) =>
-{
-  try
-  {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
     var alias = cfg["Alias"] ?? "";
     var cvu = cfg["CVU"] ?? "";
-
-    var ar = CultureInfo.GetCultureInfo("es-AR");
-    var tzAr = TimeZoneInfo.CreateCustomTimeZone("AR", TimeSpan.FromHours(-3), "AR", "AR");
-
-    var connStr = NormalizeConnString(cfg);
-    if (string.IsNullOrWhiteSpace(connStr))
-        return Results.Content("<h2>ERROR: No hay ConnectionStrings:Db</h2>", "text/html; charset=utf-8");
-
-    // últimos 5 minutos (igual que tu UI) y tope 50
-    //var desdeUtc = DateTimeOffset.UtcNow.AddMinutes(-5);
-
-    var rowsHtml = new StringBuilder();
-
-    await using (var conn = new NpgsqlConnection(connStr))
-    {
-        await conn.OpenAsync();
-
-        var sql = @"
-            select id, payment_id, fecha_utc, monto, status, payment_type
-from transfers
-order by id desc
-limit 20;
-        ";
-
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        //cmd.Parameters.AddWithValue("desde", desdeUtc);
-
-        await using var rd = await cmd.ExecuteReaderAsync();
-
-        bool any = false;
-
-        while (await rd.ReadAsync())
-        {
-            any = true;
-
-            var fechaUtc = rd.GetFieldValue<DateTimeOffset>(rd.GetOrdinal("fecha_utc"));
-            // mostrar AR (-03)
-            var fechaAr = TimeZoneInfo.ConvertTime(fechaUtc, tzAr);
-
-            var monto = rd.GetDecimal(rd.GetOrdinal("monto"));
-            var status = rd.GetString(rd.GetOrdinal("status"));
-            var medio = rd.GetString(rd.GetOrdinal("payment_type"));
-            var paymentId = rd.GetString(rd.GetOrdinal("payment_id"));
-
-            var pillClass = (status == "approved" || status == "accredited") ? "ok" : "bad";
-
-            rowsHtml.Append("<tr>");
-            rowsHtml.Append("<td class='mono'>").Append(fechaAr.ToString("dd/MM HH:mm:ss")).Append("</td>");
-            rowsHtml.Append("<td class='money'>").Append(monto.ToString("C", ar)).Append("</td>");
-            rowsHtml.Append("<td>").Append(medio).Append("</td>");
-            rowsHtml.Append("<td><span class='pill ").Append(pillClass).Append("'>").Append(status).Append("</span></td>");
-            rowsHtml.Append("<td class='muted mono'>").Append(paymentId).Append("</td>");
-            rowsHtml.Append("</tr>");
-        }
-
-        if (!any)
-        {
-            rowsHtml.Append("<tr><td colspan='5'><div class='errorBox'>No hay movimientos en los últimos 5 minutos.</div></td></tr>");
-        }
-    }
 
     var showAccountBox = !(string.IsNullOrWhiteSpace(alias) && string.IsNullOrWhiteSpace(cvu));
     var accountBoxHtml = showAccountBox
@@ -269,44 +210,45 @@ limit 20;
           + "</div>"
         : "";
 
-    var htmlTemplate = @"
+    // Nota: NO usamos meta refresh. Actualizamos con JS cada 8s.
+    var html = $@"
 <!doctype html>
 <html lang='es'>
 <head>
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>MP Transferencias</title>
-<meta http-equiv='refresh' content='8'>
 <style>
-:root{
+:root{{
   --bg:#0b1220; --card:#0f172a; --border:#1f2937;
   --muted:#94a3b8; --text:#e5e7eb; --accent:#22c55e; --danger:#ef4444;
-}
-*{box-sizing:border-box}
-body{
+}}
+*{{box-sizing:border-box}}
+body{{
   margin:0;
   font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
   background:radial-gradient(1200px 600px at 20% -10%, rgba(34,197,94,.15), transparent),
              radial-gradient(900px 500px at 100% 0%, rgba(59,130,246,.12), transparent),
              var(--bg);
   color:var(--text);
-}
-.container{max-width:1200px;margin:18px auto;padding:0 14px 80px}
-.card{
+}}
+.container{{max-width:1200px;margin:18px auto;padding:0 14px 80px}}
+.card{{
   background:linear-gradient(180deg, rgba(255,255,255,.03), transparent), var(--card);
   border:1px solid var(--border); border-radius:18px;
   box-shadow:0 10px 30px rgba(0,0,0,.25); overflow:hidden;
-}
-.header{
+}}
+.header{{
   padding:18px 18px 14px;
   background:linear-gradient(90deg, rgba(34,197,94,.16), transparent 60%);
   border-bottom:1px solid var(--border);
-}
-.titleRow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
-h1{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}
-.sub{margin-top:6px;color:rgba(226,232,240,.9);font-size:14px;font-weight:600}
+}}
+.titleRow{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+h1{{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}}
+.sub{{margin-top:6px;color:rgba(226,232,240,.9);font-size:14px;font-weight:600}}
+.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}}
 
-.accountBox{
+.accountBox{{
   margin-top:14px;
   display:grid;
   grid-template-columns:1fr 1fr;
@@ -315,62 +257,73 @@ h1{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}
   background:rgba(255,255,255,.03);
   border:1px solid rgba(148,163,184,.18);
   border-radius:14px;
-}
-.kv{
-  display:flex;
-  flex-direction:column;
-  gap:6px;
-  padding:12px 14px;
-  border-radius:12px;
+}}
+.kv{{
+  display:flex;flex-direction:column;gap:6px;
+  padding:12px 14px;border-radius:12px;
   background:linear-gradient(180deg, rgba(34,197,94,.12), rgba(255,255,255,.02));
   border:1px solid rgba(34,197,94,.22);
-}
-.k{
-  color:rgba(226,232,240,.85);
-  font-size:12px;
-  letter-spacing:.8px;
-  text-transform:uppercase;
-  font-weight:800;
-}
-.v{font-weight:900;font-size:18px;word-break:break-all}
+}}
+.k{{color:rgba(226,232,240,.85);font-size:12px;letter-spacing:.8px;text-transform:uppercase;font-weight:800}}
+.v{{font-weight:900;font-size:18px;word-break:break-all}}
 
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
-.tableWrap{overflow:auto}
-table{width:100%;border-collapse:collapse;min-width:760px}
-thead th{
-  position:sticky;top:0;z-index:1;
-  background:rgba(15,23,42,.95);backdrop-filter:blur(8px);
-  border-bottom:1px solid var(--border)
-}
-th,td{padding:12px 14px;border-bottom:1px solid rgba(31,41,55,.85);font-size:14.5px;white-space:nowrap}
-tbody tr:nth-child(odd){background:rgba(255,255,255,.015)}
-th{text-align:left;color:#cbd5e1;font-weight:700}
-.money{font-weight:900}
-.pill{
-  display:inline-flex;padding:4px 10px;border-radius:999px;
-  font-size:12px;font-weight:800;border:1px solid rgba(255,255,255,.08)
-}
-.ok{background:rgba(34,197,94,.18);color:#bbf7d0}
-.bad{background:rgba(239,68,68,.18);color:#fecaca}
-.muted{color:var(--muted)}
-.errorBox{
+.sectionTitle{{
+  display:flex;justify-content:space-between;align-items:center;
+  padding:14px 18px;border-top:1px solid var(--border);
+  background:rgba(255,255,255,.02);
+}}
+.sectionTitle h2{{margin:0;font-size:16px;font-weight:900;letter-spacing:.2px}}
+.badge{{
+  display:inline-flex;align-items:center;gap:8px;
+  padding:6px 10px;border-radius:999px;
+  border:1px solid rgba(255,255,255,.08);
+  color:#cbd5e1;background:rgba(255,255,255,.03);
+  font-size:12px;font-weight:800;
+}}
+.badge b{{color:#fff}}
+
+.tableWrap{{overflow:auto}}
+table{{width:100%;border-collapse:collapse;min-width:860px}}
+thead th{{position:sticky;top:0;z-index:1;background:rgba(15,23,42,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}}
+th,td{{padding:12px 14px;border-bottom:1px solid rgba(31,41,55,.85);font-size:14.5px;white-space:nowrap}}
+tbody tr:nth-child(odd){{background:rgba(255,255,255,.015)}}
+th{{text-align:left;color:#cbd5e1;font-weight:700}}
+.money{{font-weight:900}}
+.pill{{display:inline-flex;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:800;border:1px solid rgba(255,255,255,.08)}}
+.ok{{background:rgba(34,197,94,.18);color:#bbf7d0}}
+.bad{{background:rgba(239,68,68,.18);color:#fecaca}}
+.muted{{color:var(--muted)}}
+
+.btn{{
+  cursor:pointer;
+  padding:8px 12px;border-radius:12px;
+  border:1px solid rgba(34,197,94,.35);
+  background:rgba(34,197,94,.12);
+  color:#bbf7d0;font-weight:900;
+}}
+.btn:disabled{{opacity:.5;cursor:not-allowed}}
+.btnDanger{{
+  border:1px solid rgba(239,68,68,.35);
+  background:rgba(239,68,68,.10);
+  color:#fecaca;
+}}
+.errorBox{{
   padding:12px 14px;border-radius:12px;
   border:1px solid rgba(239,68,68,.35);
-  background:rgba(239,68,68,.08);color:#fecaca;
-  font-size:14px;
-}
-.footer{
+  background:rgba(239,68,68,.08);color:#fecaca;font-size:14px;
+}}
+.footer{{
   position:fixed;bottom:0;left:0;right:0;padding:12px 14px;text-align:center;
   color:rgba(148,163,184,.85);font-size:12px;
   background:rgba(11,18,32,.75);backdrop-filter:blur(8px);
   border-top:1px solid rgba(31,41,55,.7)
-}
-.brand{color:#e5e7eb;font-weight:800}
-@media (max-width: 700px){
-  h1{font-size:24px}
-  .accountBox{grid-template-columns:1fr}
-  .v{font-size:16px}
-}
+}}
+.brand{{color:#e5e7eb;font-weight:800}}
+@media (max-width: 700px){{
+  h1{{font-size:24px}}
+  .accountBox{{grid-template-columns:1fr}}
+  .v{{font-size:16px}}
+}}
 </style>
 </head>
 <body>
@@ -378,51 +331,190 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
   <div class='card'>
     <div class='header'>
       <div class='titleRow'>
-        <h1>MP Transferencias · %%CUENTA%%</h1>
-        <div class='sub'>Últimos <b>5 minutos</b> · Actualiza cada 8 segundos</div>
+        <h1>MP Transferencias · {cuenta}</h1>
+        <div class='sub'>Pendientes (últimas <b>20</b>) · Actualiza cada <b>8</b> segundos</div>
       </div>
-      %%ACCOUNT_BOX%%
+      {accountBoxHtml}
+    </div>
+
+    <div class='sectionTitle'>
+      <h2>Pendientes</h2>
+      <div class='badge'>Actualizando…</div>
     </div>
 
     <div class='tableWrap'>
       <table>
         <thead>
           <tr>
-            <th>Fecha</th>
+            <th>✅</th>
+            <th>Fecha (AR)</th>
             <th>Monto</th>
             <th>Medio</th>
             <th>Estado</th>
-            <th class='muted'>ID</th>
+            <th class='muted'>Payment ID</th>
           </tr>
         </thead>
-        <tbody>
-          %%ROWS%%
+        <tbody id='pendingBody'>
+          <tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>
         </tbody>
       </table>
     </div>
+
+    <div class='sectionTitle'>
+      <h2>Aceptadas hoy (por vos)</h2>
+      <div class='badge'>Total hoy: <b id='totalHoy'>$0</b> · Cant: <b id='cantHoy'>0</b></div>
+    </div>
+
+    <div class='tableWrap'>
+      <table>
+        <thead>
+          <tr>
+            <th>Hora (AR)</th>
+            <th>Monto</th>
+            <th>Medio</th>
+            <th>Estado</th>
+            <th class='muted'>Payment ID</th>
+          </tr>
+        </thead>
+        <tbody id='acceptedBody'>
+          <tr><td colspan='5'><div class='errorBox'>Cargando…</div></td></tr>
+        </tbody>
+      </table>
+    </div>
+
   </div>
 </div>
 
 <div class='footer'>By <span class='brand'>PS3 Larroque</span></div>
+
+<script>
+const arMoney = new Intl.NumberFormat('es-AR', {{ style:'currency', currency:'ARS' }});
+
+function pillClass(status) {{
+  if (!status) return 'bad';
+  const s = status.toLowerCase();
+  return (s === 'approved' || s === 'accredited') ? 'ok' : 'bad';
+}}
+
+function toArDate(iso) {{
+  try {{
+    // iso viene con offset/utc -> mostramos AR
+    const d = new Date(iso);
+    // formato dd/MM HH:mm:ss
+    const pad = (n)=> String(n).padStart(2,'0');
+    return pad(d.getDate()) + '/' + pad(d.getMonth()+1) + ' ' +
+           pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }} catch {{
+    return iso;
+  }}
+}}
+
+async function loadPending() {{
+  const body = document.getElementById('pendingBody');
+  try {{
+    const r = await fetch('/api/transfers/pending?limit=20');
+    const j = await r.json();
+
+    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error pending');
+
+    if (!j.items || j.items.length === 0) {{
+      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay transferencias pendientes.</div></td></tr>`;
+      return;
+    }}
+
+    body.innerHTML = j.items.map(x => `
+      <tr data-id='${{x.id}}'>
+        <td>
+          <button class='btn' onclick='ackTransfer(${{x.id}}, this)'>Aceptar</button>
+        </td>
+        <td class='mono'>${{toArDate(x.fecha_utc)}}</td>
+        <td class='money'>${{arMoney.format(x.monto)}}</td>
+        <td>${{x.payment_type}}</td>
+        <td><span class='pill ${{pillClass(x.status)}}'>${{x.status}}</span></td>
+        <td class='muted mono'>${{x.payment_id}}</td>
+      </tr>
+    `).join('');
+  }} catch (e) {{
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando pendientes: ${{e.message}}</div></td></tr>`;
+  }}
+}}
+
+async function loadAcceptedToday() {{
+  const body = document.getElementById('acceptedBody');
+  const total = document.getElementById('totalHoy');
+  const cant = document.getElementById('cantHoy');
+
+  try {{
+    const r = await fetch('/api/transfers/accepted/today');
+    const j = await r.json();
+
+    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error accepted/today');
+
+    total.textContent = arMoney.format(j.total || 0);
+    cant.textContent = (j.count || 0);
+
+    if (!j.items || j.items.length === 0) {{
+      body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Todavía no aceptaste transferencias hoy.</div></td></tr>`;
+      return;
+    }}
+
+    body.innerHTML = j.items.map(x => `
+      <tr>
+        <td class='mono'>${{toArDate(x.fecha_utc)}}</td>
+        <td class='money'>${{arMoney.format(x.monto)}}</td>
+        <td>${{x.payment_type}}</td>
+        <td><span class='pill ${{pillClass(x.status)}}'>${{x.status}}</span></td>
+        <td class='muted mono'>${{x.payment_id}}</td>
+      </tr>
+    `).join('');
+  }} catch (e) {{
+    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Error cargando aceptadas: ${{e.message}}</div></td></tr>`;
+    total.textContent = '$0';
+    cant.textContent = '0';
+  }}
+}}
+
+async function ackTransfer(id, btn) {{
+  try {{
+    btn.disabled = true;
+    const r = await fetch(`/api/transfers/${{id}}/ack`, {{
+      method: 'POST'
+    }});
+
+    if (r.status === 409) {{
+      btn.classList.add('btnDanger');
+      btn.textContent = 'Ya tomada';
+      // refrescamos igual
+      await refreshAll();
+      return;
+    }}
+
+    if (!r.ok) {{
+      const t = await r.text();
+      throw new Error(t || 'Error aceptando');
+    }}
+
+    // OK: refrescamos ambos paneles
+    await refreshAll();
+  }} catch (e) {{
+    btn.disabled = false;
+    alert('Error al aceptar: ' + e.message);
+  }}
+}}
+
+async function refreshAll() {{
+  await loadPending();
+  await loadAcceptedToday();
+}}
+
+refreshAll();
+setInterval(refreshAll, 8000);
+</script>
+
 </body>
 </html>
 ";
-
-    var html = htmlTemplate
-        .Replace("%%CUENTA%%", cuenta)
-        .Replace("%%ACCOUNT_BOX%%", accountBoxHtml)
-        .Replace("%%ROWS%%", rowsHtml.ToString());
-
     return Results.Content(html, "text/html; charset=utf-8");
-  }catch (Exception ex)
-  {
-    return Results.Problem(
-            title: "ERROR EN HOME (/)",
-            detail: ex.ToString(),
-            statusCode: 500
-        );
-  }
 });
-    
 
 app.Run();

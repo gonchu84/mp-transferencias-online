@@ -18,12 +18,21 @@ public class TransfersController : ControllerBase
 
     private string GetConn()
     {
-        var cs = _cfg.GetConnectionString("Db");
-        if (string.IsNullOrWhiteSpace(cs))
-            throw new Exception("ConnectionStrings:Db vacío");
+        // 1) Primero ConnectionStrings:Db
+        var cs = _cfg.GetConnectionString("Db") ?? "";
 
-        // aceptar postgres://...
-        if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase))
+        // 2) Fallback por si Render lo pone en DATABASE_URL
+        if (string.IsNullOrWhiteSpace(cs))
+            cs = _cfg["DATABASE_URL"] ?? "";
+
+        if (string.IsNullOrWhiteSpace(cs))
+            throw new Exception("No se encontró ConnectionStrings:Db ni DATABASE_URL");
+
+        cs = cs.Trim().Trim('"');
+
+        // aceptar postgres:// y postgresql://
+        if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+            cs.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
             cs = ConvertPostgresUrlToConnectionString(cs);
 
         return cs;
@@ -97,7 +106,153 @@ public class TransfersController : ControllerBase
         return Ok(new { ok = true, count = items.Count, items });
     }
 
-    // ✅ MP: /api/transfers/mp/me  (te devuelve el usuario de MP para validar token)
+    // ✅ NUEVO: Pendientes (no aceptadas por nadie)
+    // GET /api/transfers/pending?limit=20
+    [HttpGet("pending")]
+    public async Task<IActionResult> Pending([FromQuery] int limit = 20)
+    {
+        limit = Math.Clamp(limit, 1, 200);
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+            select t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status
+            from transfers t
+            left join transfer_ack a on a.transfer_id = t.id
+            where a.transfer_id is null
+            order by t.id desc
+            limit @limit;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("limit", limit);
+
+        var items = new List<object>();
+        await using var rd = await cmd.ExecuteReaderAsync();
+        while (await rd.ReadAsync())
+        {
+            items.Add(new
+            {
+                id = rd.GetInt64(0),
+                payment_id = rd.GetString(1),
+                fecha_utc = rd.GetFieldValue<DateTimeOffset>(2).ToString("o"),
+                monto = rd.GetDecimal(3),
+                payment_type = rd.GetString(4),
+                status = rd.GetString(5)
+            });
+        }
+
+        return Ok(new { ok = true, count = items.Count, items });
+    }
+
+    // ✅ NUEVO: Aceptadas HOY por el usuario logueado (detalle + total)
+    // GET /api/transfers/accepted/today
+    [HttpGet("accepted/today")]
+    public async Task<IActionResult> AcceptedToday()
+    {
+        var username = User.Identity?.Name ?? "unknown";
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+            select
+                t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
+                a.username, a.ack_at_utc, a.ack_date_ar
+            from transfer_ack a
+            join transfers t on t.id = a.transfer_id
+            where a.username = @username
+              and a.ack_date_ar = (now() at time zone 'America/Argentina/Buenos_Aires')::date
+            order by a.ack_at_utc desc;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("username", username);
+
+        var items = new List<object>();
+        decimal total = 0;
+
+        await using var rd = await cmd.ExecuteReaderAsync();
+        while (await rd.ReadAsync())
+        {
+            var monto = rd.GetDecimal(3);
+            total += monto;
+
+            items.Add(new
+            {
+                id = rd.GetInt64(0),
+                payment_id = rd.GetString(1),
+                fecha_utc = rd.GetFieldValue<DateTimeOffset>(2).ToString("o"),
+                monto,
+                payment_type = rd.GetString(4),
+                status = rd.GetString(5),
+                accepted_by = rd.GetString(6),
+                ack_at_utc = rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
+                ack_date_ar = rd.GetFieldValue<DateTime>(8).ToString("yyyy-MM-dd")
+            });
+        }
+
+        return Ok(new { ok = true, username, count = items.Count, total, items });
+    }
+
+    // ✅ NUEVO: Aceptadas por DÍA (por usuario logueado) - historial + total
+    // GET /api/transfers/accepted/by-day?date=2025-12-31
+    [HttpGet("accepted/by-day")]
+    public async Task<IActionResult> AcceptedByDay([FromQuery] string date)
+    {
+        var username = User.Identity?.Name ?? "unknown";
+
+        if (!DateTime.TryParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day))
+        {
+            return BadRequest(new { ok = false, message = "Formato inválido. Usá yyyy-MM-dd", date });
+        }
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+            select
+                t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
+                a.username, a.ack_at_utc, a.ack_date_ar
+            from transfer_ack a
+            join transfers t on t.id = a.transfer_id
+            where a.username = @username
+              and a.ack_date_ar = @day::date
+            order by a.ack_at_utc desc;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("username", username);
+        cmd.Parameters.AddWithValue("day", day);
+
+        var items = new List<object>();
+        decimal total = 0;
+
+        await using var rd = await cmd.ExecuteReaderAsync();
+        while (await rd.ReadAsync())
+        {
+            var monto = rd.GetDecimal(3);
+            total += monto;
+
+            items.Add(new
+            {
+                id = rd.GetInt64(0),
+                payment_id = rd.GetString(1),
+                fecha_utc = rd.GetFieldValue<DateTimeOffset>(2).ToString("o"),
+                monto,
+                payment_type = rd.GetString(4),
+                status = rd.GetString(5),
+                accepted_by = rd.GetString(6),
+                ack_at_utc = rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
+                ack_date_ar = rd.GetFieldValue<DateTime>(8).ToString("yyyy-MM-dd")
+            });
+        }
+
+        return Ok(new { ok = true, username, date, count = items.Count, total, items });
+    }
+
+    // ✅ MP: /api/transfers/mp/me
     [HttpGet("mp/me")]
     public async Task<IActionResult> MpMe()
     {
@@ -124,18 +279,16 @@ public class TransfersController : ControllerBase
         }
     }
 
-    // ✅ MP SEARCH (para testear rango sin depender del poller)
+    // ✅ MP SEARCH
     // /api/transfers/mp/search?minutes=1440&payment_type_id=bank_transfer
     [HttpGet("mp/search")]
     public async Task<IActionResult> MpSearch([FromQuery] int minutes = 60, [FromQuery(Name = "payment_type_id")] string paymentTypeId = "bank_transfer")
     {
-        minutes = Math.Clamp(minutes, 1, 60 * 24 * 7); // hasta 7 días
+        minutes = Math.Clamp(minutes, 1, 60 * 24 * 7);
 
         var endUtc = DateTimeOffset.UtcNow;
         var beginUtc = endUtc.AddMinutes(-minutes);
 
-        // ✅ ISO 8601 válido (MP lo acepta)
-        // ejemplo: 2025-12-30T19:08:12.993Z
         var beginStr = beginUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
         var endStr = endUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
 
@@ -170,7 +323,7 @@ public class TransfersController : ControllerBase
         }
     }
 
-    // ✅ POST: /api/transfers/payment/{paymentId}/ack  (ACK por payment_id de MP)
+    // ✅ POST: /api/transfers/payment/{paymentId}/ack
     [HttpPost("payment/{paymentId}/ack")]
     public async Task<IActionResult> AckByPaymentId(string paymentId)
     {
@@ -179,7 +332,6 @@ public class TransfersController : ControllerBase
         await using var conn = new NpgsqlConnection(GetConn());
         await conn.OpenAsync();
 
-        // 1) buscar el id interno (transfers.id) por payment_id
         var findSql = "select id from transfers where payment_id = @paymentId limit 1;";
         long transferId;
 
@@ -199,7 +351,6 @@ public class TransfersController : ControllerBase
             transferId = (long)obj;
         }
 
-        // 2) insertar ACK
         var insertSql = """
             insert into transfer_ack (transfer_id, username, ack_at_utc, ack_date_ar)
             values (
@@ -225,7 +376,7 @@ public class TransfersController : ControllerBase
         }
     }
 
-    // ✅ POST: /api/transfers/{transferId}/ack  (ACK por ID interno)
+    // ✅ POST: /api/transfers/{transferId}/ack
     [HttpPost("{transferId:long}/ack")]
     public async Task<IActionResult> Ack(long transferId)
     {
