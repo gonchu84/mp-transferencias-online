@@ -155,6 +155,8 @@ app.MapControllers();
 // ✅ HOME: LEE DESDE DB (Opción A)
 app.MapGet("/", async (HttpContext ctx, IConfiguration cfg) =>
 {
+  try
+  {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
     var alias = cfg["Alias"] ?? "";
     var cvu = cfg["CVU"] ?? "";
@@ -373,6 +375,15 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
         .Replace("%%ROWS%%", rowsHtml.ToString());
 
     return Results.Content(html, "text/html; charset=utf-8");
+  }catch (Exception ex)
+  {
+    return Results.Problem(
+            title: "ERROR EN HOME (/)",
+            detail: ex.ToString(),
+            statusCode: 500
+        );
+  }
 });
+    
 
 app.Run();
