@@ -98,9 +98,9 @@ public class MpPollingService : BackgroundService
                 continue;
 
             // Campos típicos
-           var fecha = DateTimeOffset
-             .Parse(dEl.GetString()!, CultureInfo.InvariantCulture)
-             .UtcDateTime;
+            var dateStr = item.GetProperty("date_created").GetString() ?? "";
+            var fechaUtc = DateTimeOffset.Parse(dateStr, null, System.Globalization.DateTimeStyles.AssumeUniversal).ToUniversalTime();
+
 
 
             var monto = item.TryGetProperty("transaction_amount", out var mEl) && mEl.ValueKind == JsonValueKind.Number
