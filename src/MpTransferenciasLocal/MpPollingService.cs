@@ -4,6 +4,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Npgsql;
+using NpgsqlTypes;
 
 public class MpPollingService : BackgroundService
 {
@@ -43,22 +44,22 @@ public class MpPollingService : BackgroundService
         await using var conn = new NpgsqlConnection(GetConn());
         await conn.OpenAsync(ct);
 
-        // 2) el mp_account activo (FK de transfers.mp_account_id)
+        // 2) mp_account activo (FK transfers.mp_account_id)
         var mpAccountId = await GetActiveMpAccountId(conn, ct);
-        var token = await GetActiveMpAccountToken(conn, mpAccountId, ct);
+        var token = await GetMpAccountToken(conn, mpAccountId, ct);
 
         if (string.IsNullOrWhiteSpace(token) || token == "PENDING")
         {
-            _log.LogWarning("mp_accounts({Id}) no tiene access_token válido. Setealo en DB.", mpAccountId);
+            _log.LogWarning("mp_accounts({Id}) no tiene access_token válido (está vacío o PENDING).", mpAccountId);
             return;
         }
 
-        // 3) Fechas: últimos X minutos (default 60)
+        // 3) Rango de fechas: últimos X minutos (default 60)
         var minutes = int.TryParse(_cfg["Polling:Minutes"], out var m) ? m : 60;
         var endUtc = DateTimeOffset.UtcNow;
         var beginUtc = endUtc.AddMinutes(-minutes);
 
-        // MercadoPago: mandamos ISO invariante
+        // MercadoPago: ISO con Z
         var beginStr = beginUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
         var endStr   = endUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
 
@@ -66,10 +67,10 @@ public class MpPollingService : BackgroundService
         var client = _http.CreateClient("MP");
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-        // OJO: NO filtremos por bank_transfer por ahora, porque puede venir como account_money.
-        // Luego afinamos.
-        var url = $"v1/payments/search?sort=date_created&criteria=desc&limit=50&range=date_created" +
-                  $"&begin_date={Uri.EscapeDataString(beginStr)}&end_date={Uri.EscapeDataString(endStr)}";
+        // NO filtrar todavía por bank_transfer (a veces viene como account_money)
+        var url =
+            $"v1/payments/search?sort=date_created&criteria=desc&limit=50&range=date_created" +
+            $"&begin_date={Uri.EscapeDataString(beginStr)}&end_date={Uri.EscapeDataString(endStr)}";
 
         var resp = await client.GetAsync(url, ct);
         var json = await resp.Content.ReadAsStringAsync(ct);
@@ -87,21 +88,26 @@ public class MpPollingService : BackgroundService
             return;
         }
 
+        var inserted = 0;
+
         foreach (var item in results.EnumerateArray())
         {
-            // id viene como número (ej 139322351059)
-            var paymentId = item.TryGetProperty("id", out var idEl)
-                ? idEl.ToString()
-                : null;
-
+            // payment_id (MP id)
+            var paymentId = item.TryGetProperty("id", out var idEl) ? idEl.ToString() : null;
             if (string.IsNullOrWhiteSpace(paymentId))
                 continue;
 
-            // Campos típicos
-            var dateStr = item.GetProperty("date_created").GetString() ?? "";
-            var fechaUtc = DateTimeOffset.Parse(dateStr, null, System.Globalization.DateTimeStyles.AssumeUniversal).ToUniversalTime();
+            // Fecha: viene como string con offset, la convertimos a UTC
+            var dateStr = item.TryGetProperty("date_created", out var dEl) ? (dEl.GetString() ?? "") : "";
+            if (string.IsNullOrWhiteSpace(dateStr))
+                continue;
 
+            // RoundtripKind respeta el offset y ToUniversalTime lo deja en UTC
+            var dto = DateTimeOffset.Parse(dateStr, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)
+                                   .ToUniversalTime();
 
+            // Para evitar el error de Npgsql con offsets, mandamos DateTime UTC
+            var fechaUtc = DateTime.SpecifyKind(dto.UtcDateTime, DateTimeKind.Utc);
 
             var monto = item.TryGetProperty("transaction_amount", out var mEl) && mEl.ValueKind == JsonValueKind.Number
                 ? mEl.GetDecimal()
@@ -110,10 +116,9 @@ public class MpPollingService : BackgroundService
             var status = item.TryGetProperty("status", out var sEl) ? (sEl.GetString() ?? "") : "";
             var paymentType = item.TryGetProperty("payment_type_id", out var pEl) ? (pEl.GetString() ?? "") : "";
 
-            // Guardamos el json entero (para debug)
             var raw = item.GetRawText();
 
-            var sql = """
+            const string sql = """
             insert into transfers
             (mp_account_id, payment_id, fecha_utc, monto, status, payment_type, json_raw)
             values
@@ -124,20 +129,23 @@ public class MpPollingService : BackgroundService
             await using var cmd = new NpgsqlCommand(sql, conn);
             cmd.Parameters.AddWithValue("mp_account_id", mpAccountId);
             cmd.Parameters.AddWithValue("payment_id", paymentId);
-            cmd.Parameters.AddWithValue("fecha_utc", fecha);
+            cmd.Parameters.AddWithValue("fecha_utc", fechaUtc);
             cmd.Parameters.AddWithValue("monto", monto);
             cmd.Parameters.AddWithValue("status", status);
             cmd.Parameters.AddWithValue("payment_type", paymentType);
-            cmd.Parameters.AddWithValue("json_raw", NpgsqlTypes.NpgsqlDbType.Jsonb, raw);
+            cmd.Parameters.Add("json_raw", NpgsqlDbType.Jsonb).Value = raw;
 
-            await cmd.ExecuteNonQueryAsync(ct);
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            if (rows > 0) inserted++;
         }
 
-        _log.LogInformation("Polling OK. mp_account_id={Id} results={Count}", mpAccountId, results.GetArrayLength());
+        _log.LogInformation("Polling OK. mp_account_id={Id} results={Count} inserted={Inserted}",
+            mpAccountId, results.GetArrayLength(), inserted);
     }
 
-    private async Task<int> GetActiveMpAccountId(NpgsqlConnection conn, CancellationToken ct)
+    private static async Task<int> GetActiveMpAccountId(NpgsqlConnection conn, CancellationToken ct)
     {
+        // prioriza activa=true
         var sql = "select id from mp_accounts where activa = true order by id limit 1;";
         await using var cmd = new NpgsqlCommand(sql, conn);
         var obj = await cmd.ExecuteScalarAsync(ct);
@@ -155,7 +163,7 @@ public class MpPollingService : BackgroundService
         return Convert.ToInt32(obj);
     }
 
-    private async Task<string> GetActiveMpAccountToken(NpgsqlConnection conn, int id, CancellationToken ct)
+    private static async Task<string> GetMpAccountToken(NpgsqlConnection conn, int id, CancellationToken ct)
     {
         var sql = "select access_token from mp_accounts where id = @id limit 1;";
         await using var cmd = new NpgsqlCommand(sql, conn);
@@ -168,8 +176,9 @@ public class MpPollingService : BackgroundService
     {
         var cs = _cfg.GetConnectionString("Db");
         if (string.IsNullOrWhiteSpace(cs))
-            throw new Exception("ConnectionStrings:Db vacío");
+            throw new Exception("ConnectionStrings:Db vacío (falta en env vars o appsettings).");
 
+        // Render a veces da DATABASE_URL tipo postgres://
         if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase))
             cs = ConvertPostgresUrlToConnectionString(cs);
 
