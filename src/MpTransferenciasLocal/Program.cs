@@ -166,55 +166,80 @@ app.MapGet("/api/transferencias", (ConcurrentQueue<object> q) => Results.Ok(q.To
 // ✅ Mapea controllers (/api/transfers/...)
 app.MapControllers();
 
-app.MapGet("/", (ConcurrentQueue<object> q, IConfiguration cfg) =>
+using Npgsql;
+using System.Globalization;
+using System.Text.Json;
+
+app.MapGet("/", async (IConfiguration cfg) =>
 {
     var cuenta = cfg["Cuenta"] ?? "Cuenta";
     var alias = cfg["Alias"] ?? "";
     var cvu = cfg["CVU"] ?? "";
 
-    var items = q.ToArray();
+    var connStr = cfg.GetConnectionString("Db");
+    if (string.IsNullOrWhiteSpace(connStr))
+        return Results.Content("<h3>Falta ConnectionStrings:Db</h3>", "text/html; charset=utf-8");
+
+    var minutes = 5;        // lo que muestra tu UI
+    var limit = 50;         // lo que querés mostrar en tabla
+
     var ar = CultureInfo.GetCultureInfo("es-AR");
 
-    string RenderRow(object x)
+    // Trae últimos X minutos desde DB
+    var rowsData = new List<(DateTimeOffset fechaUtc, decimal monto, string medio, string status, string paymentId)>();
+
+    await using (var conn = new NpgsqlConnection(connStr))
     {
-        var json = JsonSerializer.Serialize(x);
-        using var d = JsonDocument.Parse(json);
-        var r = d.RootElement;
+        await conn.OpenAsync();
 
-        if (r.TryGetProperty("error", out var err))
+        var sql = @"
+            select fecha_utc, monto, payment_type, status, payment_id
+            from transfers
+            where fecha_utc >= (now() at time zone 'utc') - make_interval(mins => @mins)
+            order by fecha_utc desc
+            limit @lim;
+        ";
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("mins", minutes);
+        cmd.Parameters.AddWithValue("lim", limit);
+
+        await using var rd = await cmd.ExecuteReaderAsync();
+        while (await rd.ReadAsync())
         {
-            var msg = err.GetString() ?? "Error";
-            var cuentaErr = r.TryGetProperty("cuenta", out var cta) ? (cta.GetString() ?? cuenta) : cuenta;
-            return "<tr><td colspan='5'><div class='errorBox'><b>" + cuentaErr + "</b> · " + msg + "</div></td></tr>";
+            // fecha_utc es timestamptz (timestamp with time zone)
+            var fecha = rd.GetFieldValue<DateTimeOffset>(0);
+            var monto = rd.GetDecimal(1);
+            var medio = rd.GetString(2);
+            var status = rd.GetString(3);
+            var paymentId = rd.GetString(4);
+
+            rowsData.Add((fecha, monto, medio, status, paymentId));
         }
+    }
 
-        var fecha = r.TryGetProperty("fecha", out var f) ? (f.GetString() ?? "") : "";
-        var estado = r.TryGetProperty("status", out var st) ? (st.GetString() ?? "") : "";
-        var medio = r.TryGetProperty("payment_type_id", out var mt) ? (mt.GetString() ?? "") : "";
-        var id = r.TryGetProperty("id", out var pid) ? pid.ToString() : "";
+    string RenderRow((DateTimeOffset fechaUtc, decimal monto, string medio, string status, string paymentId) x)
+    {
+        // Para mostrar lindo en Argentina: convertimos a hora local (-03)
+        var fechaLocal = x.fechaUtc.ToOffset(TimeSpan.FromHours(-3));
+        var fechaTxt = fechaLocal.ToString("dd/MM/yyyy HH:mm:ss");
 
-        string montoTxt = "";
-        if (r.TryGetProperty("monto", out var m))
-        {
-            if (m.ValueKind == JsonValueKind.Number && m.TryGetDecimal(out var dec))
-                montoTxt = dec.ToString("C", ar);
-            else
-                montoTxt = "$ " + m.ToString();
-        }
-
-        var pillClass = (estado == "approved" || estado == "accredited") ? "ok" : "bad";
+        var montoTxt = x.monto.ToString("C", ar);
+        var pillClass = (x.status == "approved" || x.status == "accredited") ? "ok" : "bad";
 
         return
             "<tr>" +
-            "<td class='mono'>" + fecha + "</td>" +
+            "<td class='mono'>" + fechaTxt + "</td>" +
             "<td class='money'>" + montoTxt + "</td>" +
-            "<td>" + medio + "</td>" +
-            "<td><span class='pill " + pillClass + "'>" + estado + "</span></td>" +
-            "<td class='muted mono'>" + id + "</td>" +
+            "<td>" + x.medio + "</td>" +
+            "<td><span class='pill " + pillClass + "'>" + x.status + "</span></td>" +
+            "<td class='muted mono'>" + x.paymentId + "</td>" +
             "</tr>";
     }
 
-    var rows = string.Join("", items.Reverse().Select(RenderRow));
+    var rows = rowsData.Count == 0
+        ? "<tr><td colspan='5' class='muted'>Sin movimientos en los últimos " + minutes + " minutos.</td></tr>"
+        : string.Join("", rowsData.Select(RenderRow));
 
     var showAccountBox = !(string.IsNullOrWhiteSpace(alias) && string.IsNullOrWhiteSpace(cvu));
     var accountBoxHtml = showAccountBox
@@ -308,12 +333,6 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 .ok{background:rgba(34,197,94,.18);color:#bbf7d0}
 .bad{background:rgba(239,68,68,.18);color:#fecaca}
 .muted{color:var(--muted)}
-.errorBox{
-  padding:12px 14px;border-radius:12px;
-  border:1px solid rgba(239,68,68,.35);
-  background:rgba(239,68,68,.08);color:#fecaca;
-  font-size:14px;
-}
 .footer{
   position:fixed;bottom:0;left:0;right:0;padding:12px 14px;text-align:center;
   color:rgba(148,163,184,.85);font-size:12px;
@@ -334,7 +353,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
     <div class='header'>
       <div class='titleRow'>
         <h1>MP Transferencias · %%CUENTA%%</h1>
-        <div class='sub'>Últimos <b>5 minutos</b> · Actualiza cada 8 segundos</div>
+        <div class='sub'>Últimos <b>%%MINUTES%% minutos</b> · Actualiza cada 8 segundos</div>
       </div>
       %%ACCOUNT_BOX%%
     </div>
@@ -365,6 +384,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 
     var html = htmlTemplate
         .Replace("%%CUENTA%%", cuenta)
+        .Replace("%%MINUTES%%", minutes.ToString())
         .Replace("%%ACCOUNT_BOX%%", accountBoxHtml)
         .Replace("%%ROWS%%", rows);
 
