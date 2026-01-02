@@ -1,20 +1,20 @@
 {
   "format": 1,
   "restore": {
-    "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {}
+    "C:\\Users\\facu\\Desktop\\Proyectos\\mp-transferencias-online\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {}
   },
   "projects": {
-    "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {
+    "C:\\Users\\facu\\Desktop\\Proyectos\\mp-transferencias-online\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
+        "projectUniqueName": "C:\\Users\\facu\\Desktop\\Proyectos\\mp-transferencias-online\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
         "projectName": "MpTransferenciasLocal",
-        "projectPath": "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
-        "packagesPath": "C:\\Users\\Usuario\\.nuget\\packages\\",
-        "outputPath": "C:\\MPTransferenciasOnline_ListoParaSubir\\MPTransferenciasLocal_Instalable\\src\\MpTransferenciasLocal\\obj\\",
+        "projectPath": "C:\\Users\\facu\\Desktop\\Proyectos\\mp-transferencias-online\\src\\MpTransferenciasLocal\\MpTransferenciasLocal.csproj",
+        "packagesPath": "C:\\Users\\facu\\.nuget\\packages\\",
+        "outputPath": "C:\\Users\\facu\\Desktop\\Proyectos\\mp-transferencias-online\\src\\MpTransferenciasLocal\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
-          "C:\\Users\\Usuario\\AppData\\Roaming\\NuGet\\NuGet.Config"
+          "C:\\Users\\facu\\AppData\\Roaming\\NuGet\\NuGet.Config"
         ],
         "originalTargetFrameworks": [
           "net8.0"
@@ -43,6 +43,10 @@
         "net8.0": {
           "targetAlias": "net8.0",
           "dependencies": {
+            "BCrypt.Net-Next": {
+              "target": "Package",
+              "version": "[4.0.3, )"
+            },
             "Npgsql": {
               "target": "Package",
               "version": "[10.0.1, )"
@@ -67,7 +71,7 @@
               "privateAssets": "all"
             }
           },
-          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.416/PortableRuntimeIdentifierGraph.json"
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.412/PortableRuntimeIdentifierGraph.json"
         }
       }
     }
