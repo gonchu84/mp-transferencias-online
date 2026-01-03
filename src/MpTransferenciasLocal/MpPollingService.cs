@@ -38,31 +38,40 @@ public class MpPollingService : BackgroundService
     }
 
     private async Task PollOnce(CancellationToken ct)
-    {
-        // 1) DB
-        await using var conn = new NpgsqlConnection(GetConn());
-        await conn.OpenAsync(ct);
+{
+    await using var conn = new NpgsqlConnection(GetConn());
+    await conn.OpenAsync(ct);
 
-        // 2) mp_account activo (FK de transfers.mp_account_id)
-        var mpAccountId = await GetActiveMpAccountId(conn, ct);
-        var token = await GetActiveMpAccountToken(conn, mpAccountId, ct);
+    // 1) Traer TODAS las cuentas activas
+    var accounts = await GetActiveAccounts(conn, ct);
+    if (accounts.Count == 0)
+    {
+        _log.LogWarning("No hay mp_accounts activas.");
+        return;
+    }
+
+    // 2) Fechas: últimos X minutos (default 60)
+    var minutes = int.TryParse(_cfg["Polling:Minutes"], out var m) ? m : 60;
+    var endUtc = DateTimeOffset.UtcNow;
+    var beginUtc = endUtc.AddMinutes(-minutes);
+
+    var beginStr = beginUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+    var endStr   = endUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+
+    int totalInserted = 0;
+    int totalResults = 0;
+
+    foreach (var acc in accounts)
+    {
+        var mpAccountId = acc.Id;
+        var token = acc.AccessToken;
 
         if (string.IsNullOrWhiteSpace(token) || token == "PENDING")
         {
-            _log.LogWarning("mp_accounts({Id}) no tiene access_token válido. Setealo en DB.", mpAccountId);
-            return;
+            _log.LogWarning("mp_accounts({Id}) sin access_token válido. Saltando.", mpAccountId);
+            continue;
         }
 
-        // 3) Fechas: últimos X minutos (default 60)
-        var minutes = int.TryParse(_cfg["Polling:Minutes"], out var m) ? m : 60;
-        var endUtc = DateTimeOffset.UtcNow;
-        var beginUtc = endUtc.AddMinutes(-minutes);
-
-        // MP requiere ISO. Mandamos en Z (UTC)
-        var beginStr = beginUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
-        var endStr   = endUtc.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
-
-        // 4) MP API
         var client = _http.CreateClient("MP");
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
@@ -75,15 +84,15 @@ public class MpPollingService : BackgroundService
 
         if (!resp.IsSuccessStatusCode)
         {
-            _log.LogWarning("MP search error {Status}. Body={Body}", (int)resp.StatusCode, json);
-            return;
+            _log.LogWarning("MP search error acc={AccId} status={Status}. Body={Body}", mpAccountId, (int)resp.StatusCode, json);
+            continue;
         }
 
         using var doc = JsonDocument.Parse(json);
         if (!doc.RootElement.TryGetProperty("results", out var results) || results.ValueKind != JsonValueKind.Array)
         {
-            _log.LogWarning("MP search sin results[]");
-            return;
+            _log.LogWarning("MP search sin results[] acc={AccId}", mpAccountId);
+            continue;
         }
 
         int inserted = 0;
@@ -96,7 +105,6 @@ public class MpPollingService : BackgroundService
 
             var dateStr = item.GetProperty("date_created").GetString() ?? "";
 
-            // IMPORTANTÍSIMO: dejarlo en UTC (offset 0) para Npgsql timestamptz
             var fechaUtc = DateTimeOffset
                 .Parse(dateStr, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal)
                 .ToUniversalTime();
@@ -128,38 +136,37 @@ public class MpPollingService : BackgroundService
             cmd.Parameters.AddWithValue("json_raw", NpgsqlTypes.NpgsqlDbType.Jsonb, raw);
 
             var rows = await cmd.ExecuteNonQueryAsync(ct);
-            inserted += rows; // 1 si insertó, 0 si ya existía
+            inserted += rows;
         }
 
-        _log.LogInformation("Polling OK. mp_account_id={Id} results={Count} inserted={Inserted}",
-            mpAccountId, results.GetArrayLength(), inserted);
+        totalResults += results.GetArrayLength();
+        totalInserted += inserted;
+
+        _log.LogInformation("Polling OK acc={AccId} results={Count} inserted={Inserted}", mpAccountId, results.GetArrayLength(), inserted);
     }
 
-    private async Task<int> GetActiveMpAccountId(NpgsqlConnection conn, CancellationToken ct)
-    {
-        var sql = "select id from mp_accounts where activa = true order by id limit 1;";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        var obj = await cmd.ExecuteScalarAsync(ct);
+    _log.LogInformation("Polling TOTAL: accounts={AccCount} results={Results} inserted={Inserted}",
+        accounts.Count, totalResults, totalInserted);
+}
 
-        if (obj == null)
-        {
-            sql = "select id from mp_accounts order by id limit 1;";
-            await using var cmd2 = new NpgsqlCommand(sql, conn);
-            obj = await cmd2.ExecuteScalarAsync(ct);
-        }
+private async Task<List<(int Id, string AccessToken)>> GetActiveAccounts(NpgsqlConnection conn, CancellationToken ct)
+{
+    var sql = """
+        select id, access_token
+        from mp_accounts
+        where activa = true
+        order by id;
+    """;
 
-        if (obj == null) throw new Exception("No hay registros en mp_accounts");
-        return Convert.ToInt32(obj);
-    }
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    var list = new List<(int, string)>();
 
-    private async Task<string> GetActiveMpAccountToken(NpgsqlConnection conn, int id, CancellationToken ct)
-    {
-        var sql = "select access_token from mp_accounts where id = @id limit 1;";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("id", id);
-        var obj = await cmd.ExecuteScalarAsync(ct);
-        return obj?.ToString() ?? "";
-    }
+    await using var rd = await cmd.ExecuteReaderAsync(ct);
+    while (await rd.ReadAsync(ct))
+        list.Add((rd.GetInt32(0), rd.IsDBNull(1) ? "" : rd.GetString(1)));
+
+    return list;
+}
 
     private string GetConn()
     {

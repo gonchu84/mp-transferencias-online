@@ -172,7 +172,7 @@ catch (Exception ex)
     Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
 }
 
-// ================= AUTH (Basic) - AHORA POR DB =================
+// ================= AUTH (Basic) - POR DB =================
 app.Use(async (ctx, next) =>
 {
     // permitir health sin auth
@@ -232,70 +232,94 @@ Console.WriteLine("Config usado: " + (configUsado ?? "(ninguno)"));
 Console.WriteLine("Cuenta: " + (builder.Configuration["Cuenta"] ?? "(null)"));
 Console.WriteLine("Alias: " + (builder.Configuration["Alias"] ?? "(null)"));
 Console.WriteLine("CVU: " + (builder.Configuration["CVU"] ?? "(null)"));
-Console.WriteLine("Token OK?: " + (!string.IsNullOrWhiteSpace(builder.Configuration["MercadoPago:AccessToken"])));
 Console.WriteLine("Auth: DB (app_users + BCrypt)");
 Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
-
 app.MapControllers();
 
-// ✅ HOME (Pendientes + Aceptadas hoy + (ADMIN) Aceptadas por día + filtro sucursal)
+// ✅ HOME (Pendientes + Aceptadas hoy + (ADMIN) Asignar cuenta + Aceptadas por día)
 app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
-    var alias = cfg["Alias"] ?? "";
-    var cvu = cfg["CVU"] ?? "";
-
     var isAdmin = ctx.User?.IsInRole("admin") == true;
 
-    var showAccountBox = !(string.IsNullOrWhiteSpace(alias) && string.IsNullOrWhiteSpace(cvu));
-    var accountBoxHtml = showAccountBox
-        ? "<div class='accountBox'>"
-          + (string.IsNullOrWhiteSpace(alias) ? "" : ("<div class='kv'><div class='k'>Alias</div><div class='v mono'>" + alias + "</div></div>"))
-          + (string.IsNullOrWhiteSpace(cvu) ? "" : ("<div class='kv'><div class='k'>CVU</div><div class='v mono'>" + cvu + "</div></div>"))
-          + "</div>"
-        : "";
+    // ✅ Ahora el box de cuenta se llena por JS desde /api/transfers/me/account
+    var accountBoxHtml = """
+<div class='accountBox' id='accountBox'>
+  <div class='kv'>
+    <div class='k'>Cuenta MP</div>
+    <div class='v mono' id='accNombre'>—</div>
+  </div>
+  <div class='kv'>
+    <div class='k'>Alias</div>
+    <div class='v mono' id='accAlias'>—</div>
+  </div>
+  <div class='kv'>
+    <div class='k'>CVU</div>
+    <div class='v mono' id='accCvu'>—</div>
+  </div>
+</div>
+""";
 
     // Bloque ADMIN (HTML) - aparece solo si role=admin
     var adminHtml = isAdmin ? """
-    <div class='sectionTitle adminTitle'>
-      <h2>ADMIN · Aceptadas por día (todas)</h2>
-      <div class='badge'>Total: <b id='adminTotal'>$0</b> · Cant: <b id='adminCant'>0</b></div>
-    </div>
+<div class='sectionTitle adminTitle'>
+  <h2>ADMIN · Asignar cuenta a sucursal</h2>
+  <div class='badge' id='assignStatus'>—</div>
+</div>
 
-    <div class='adminBar'>
-      <label class='adminLbl'>Día</label>
-      <input id='adminDate' type='date' class='adminInput' />
+<div class='adminBar'>
+  <label class='adminLbl'>Sucursal</label>
+  <select id='assignSucursal' class='adminInput'>
+    <option value=''>Elegí sucursal…</option>
+  </select>
 
-      <label class='adminLbl'>Sucursal</label>
-      <select id='adminSucursal' class='adminInput'>
-        <option value=''>Todas</option>
-      </select>
+  <label class='adminLbl'>Cuenta MP</label>
+  <select id='assignMpAccount' class='adminInput'>
+    <option value=''>Elegí cuenta…</option>
+  </select>
 
-      <button class='btn' onclick='loadAdminAcceptedByDay()'>Buscar</button>
-      <span class='muted' id='adminHint'></span>
-    </div>
+  <button class='btn' onclick='assignMpAccountToSucursal()'>Asignar</button>
+</div>
 
-    <div class='tableWrap'>
-      <table>
-        <thead>
-          <tr>
-            <th>Hora (AR)</th>
-            <th>Monto</th>
-            <th>Medio</th>
-            <th>Estado</th>
-            <th>Aceptada por</th>
-            <th class='muted'>Payment ID</th>
-          </tr>
-        </thead>
-        <tbody id='adminAcceptedBody'>
-          <tr><td colspan='6'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
-        </tbody>
-      </table>
-    </div>
-    """ : "";
+<div class='sectionTitle adminTitle' style='border-top:1px solid var(--border);'>
+  <h2>ADMIN · Aceptadas por día (todas)</h2>
+  <div class='badge'>Total: <b id='adminTotal'>$0</b> · Cant: <b id='adminCant'>0</b></div>
+</div>
+
+<div class='adminBar'>
+  <label class='adminLbl'>Día</label>
+  <input id='adminDate' type='date' class='adminInput' />
+
+  <label class='adminLbl'>Sucursal</label>
+  <select id='adminSucursal' class='adminInput'>
+    <option value=''>Todas</option>
+  </select>
+
+  <button class='btn' onclick='loadAdminAcceptedByDay()'>Buscar</button>
+  <span class='muted' id='adminHint'></span>
+</div>
+
+<div class='tableWrap'>
+  <table>
+    <thead>
+      <tr>
+        <th>Hora (AR)</th>
+        <th>Monto</th>
+        <th>Medio</th>
+        <th>Estado</th>
+        <th>Aceptada por</th>
+        <th class='muted'>Payment ID</th>
+      </tr>
+    </thead>
+    <tbody id='adminAcceptedBody'>
+      <tr><td colspan='6'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
+    </tbody>
+  </table>
+</div>
+""" : "";
 
     // ✅ IMPORTANTE: usamos $$""" ... """ para que NO se rompa con { } del JS
     var html = $$"""
@@ -335,7 +359,7 @@ h1{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}
 .sub{margin-top:6px;color:rgba(226,232,240,.9);font-size:14px;font-weight:600}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 .accountBox{
-  margin-top:14px; display:grid; grid-template-columns:1fr 1fr; gap:12px;
+  margin-top:14px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;
   padding:14px; background:rgba(255,255,255,.03);
   border:1px solid rgba(148,163,184,.18); border-radius:14px;
 }
@@ -505,6 +529,30 @@ function toArDate(iso) {
            pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   } catch {
     return iso;
+  }
+}
+
+// ===== Cuenta asignada (Alias/CVU) =====
+async function loadMyAccountBox() {
+  try {
+    const r = await fetch('/api/transfers/me/account');
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error me/account');
+
+    const n = document.getElementById('accNombre');
+    const a = document.getElementById('accAlias');
+    const c = document.getElementById('accCvu');
+
+    if (n) n.textContent = j.nombre || '—';
+    if (a) a.textContent = j.alias || '—';
+    if (c) c.textContent = j.cvu || '—';
+  } catch (e) {
+    const n = document.getElementById('accNombre');
+    const a = document.getElementById('accAlias');
+    const c = document.getElementById('accCvu');
+    if (n) n.textContent = 'Sin cuenta asignada';
+    if (a) a.textContent = '—';
+    if (c) c.textContent = '—';
   }
 }
 
@@ -680,13 +728,83 @@ async function refreshAll() {
   await loadAcceptedToday();
 }
 
+// ===== ADMIN: Asignar cuenta a sucursal =====
+async function loadAssignSucursales() {
+  const sel = document.getElementById('assignSucursal');
+  if (!sel) return;
+
+  try {
+    const r = await fetch('/api/transfers/admin/sucursales');
+    const j = await r.json();
+    if (!r.ok || !j.ok) return;
+
+    sel.innerHTML = `<option value=''>Elegí sucursal…</option>` +
+      (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
+  } catch {}
+}
+
+async function loadMpAccounts() {
+  const sel = document.getElementById('assignMpAccount');
+  if (!sel) return;
+
+  try {
+    const r = await fetch('/api/transfers/admin/mp-accounts');
+    const j = await r.json();
+    if (!r.ok || !j.ok) return;
+
+    const items = j.items || [];
+    const opt = items.map(x => {
+      const label = `${x.id} · ${x.nombre}${x.activa ? '' : ' (inactiva)'}`;
+      return `<option value="${x.id}">${label}</option>`;
+    }).join('');
+
+    sel.innerHTML = `<option value=''>Elegí cuenta…</option>` + opt;
+  } catch {}
+}
+
+async function assignMpAccountToSucursal() {
+  const suc = document.getElementById('assignSucursal')?.value || '';
+  const acc = document.getElementById('assignMpAccount')?.value || '';
+  const badge = document.getElementById('assignStatus');
+
+  if (!suc || !acc) {
+    if (badge) badge.textContent = 'Elegí sucursal y cuenta';
+    return;
+  }
+
+  try {
+    if (badge) badge.textContent = 'Asignando...';
+
+    const r = await fetch('/api/transfers/admin/assign-mp-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: suc, mpAccountId: Number(acc) })
+    });
+
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error asignando');
+
+    if (badge) badge.textContent = `OK · ${suc} → cuenta ${acc}`;
+
+    // Por si estás probando logueado como sucursal, refrescamos box + listas
+    await loadMyAccountBox();
+    await refreshAll();
+  } catch (e) {
+    if (badge) badge.textContent = `Error: ${e.message}`;
+  }
+}
+
+// init
+loadMyAccountBox();
 refreshAll();
 setInterval(refreshAll, 8000);
 
-// si es admin, cargamos el combo y traemos hoy por defecto
+// admin init (si no existen elementos, las funciones salen solas)
 setAdminDefaultDateToday();
 loadAdminSucursales();
 loadAdminAcceptedByDay();
+loadAssignSucursales();
+loadMpAccounts();
 </script>
 
 </body>
@@ -695,6 +813,8 @@ loadAdminAcceptedByDay();
 
     // inyectamos el bloque admin solo si corresponde
     html = html.Replace("{{adminHtml}}", adminHtml);
+    html = html.Replace("{{accountBoxHtml}}", accountBoxHtml);
+    html = html.Replace("{{cuenta}}", cuenta);
 
     return Results.Content(html, "text/html; charset=utf-8");
 });
