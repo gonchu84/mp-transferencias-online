@@ -17,6 +17,17 @@ builder.Configuration.AddEnvironmentVariables();
 // ================= SERVICES =================
 builder.Services.AddControllers();
 
+builder.Services
+    .AddAuthentication("Basic")
+    .AddScheme<AuthenticationSchemeOptions, DummyAuthHandler>("Basic", _ => { });
+
+builder.Services.AddAuthorization();
+
+builder.Services.AddHttpClient();
+
+builder.Services.AddHostedService<MpPollingService>();
+
+
 // 🔑 AUTENTICACIÓN (CLAVE PARA QUE FUNCIONE [Authorize])
 builder.Services
     .AddAuthentication("Basic")
