@@ -1,7 +1,5 @@
-using System.Globalization;
 using System.Security.Claims;
 using System.Text;
-using Microsoft.AspNetCore.Authorization;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -41,17 +39,10 @@ builder.Configuration.AddEnvironmentVariables();
 // ================= SERVICES =================
 builder.Services.AddControllers();
 builder.Services.AddAuthorization();
-
-builder.Services.AddHttpClient("MP", c =>
-{
-    c.BaseAddress = new Uri("https://api.mercadopago.com/");
-});
-
-// Polling (tu clase existente)
 builder.Services.AddHostedService<MpPollingService>();
 
 // ================= HELPERS =================
-bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
+static bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
 {
     user = string.Empty;
     pass = string.Empty;
@@ -76,7 +67,6 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
     }
 }
 
-// Normaliza ConnectionString (Render postgres:// o DATABASE_URL)
 static string NormalizeConnString(IConfiguration cfg)
 {
     var cs = cfg.GetConnectionString("Db") ?? "";
@@ -116,7 +106,6 @@ static string NormalizeConnString(IConfiguration cfg)
     return cs;
 }
 
-// Valida usuario/clave contra DB usando BCrypt
 static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
     IConfiguration cfg,
     string username,
@@ -166,15 +155,20 @@ catch (Exception ex)
     Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
 }
 
-// ================= PIPELINE (ARREGLADO) =================
+// ================= PIPELINE =================
 app.UseRouting();
 
-// ================= AUTH (Basic) - POR DB =================
+// ✅ Opción A: Basic Auth que NO molesta con popups infinitos
+// Solo challengea "/" y "/api/*" (así el browser guarda credenciales y no te pide por favicon/manifests)
 app.Use(async (ctx, next) =>
 {
-    // permitir health + favicon sin auth
-    if (ctx.Request.Path.StartsWithSegments("/health") ||
-        ctx.Request.Path.StartsWithSegments("/favicon.ico"))
+    var path = ctx.Request.Path.Value ?? "";
+
+    var needsAuth =
+        path == "/" ||
+        path.StartsWith("/api", StringComparison.OrdinalIgnoreCase);
+
+    if (!needsAuth)
     {
         await next();
         return;
@@ -222,7 +216,7 @@ app.Use(async (ctx, next) =>
 
 app.UseAuthorization();
 
-// ✅ Evita 404 de favicon en consola del navegador
+// ✅ Evita 404 del favicon y, sobre todo, evita popups raros por assets
 app.MapGet("/favicon.ico", () => Results.NoContent());
 
 // ================= LOG =================
@@ -230,13 +224,13 @@ Console.WriteLine("========================================");
 Console.WriteLine("MPTransferenciasLocal iniciado");
 Console.WriteLine("ContentRootPath: " + builder.Environment.ContentRootPath);
 Console.WriteLine("Config usado: " + (configUsado ?? "(ninguno)"));
-Console.WriteLine("Auth: DB (app_users + BCrypt)");
+Console.WriteLine("Auth: Basic + DB (app_users + BCrypt)");
 Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
 
-// ✅ IMPORTANTE: sin esto, /api/transfers/* da 404
+// ✅ SIN ESTO /api/transfers/* da 404
 app.MapControllers();
 
 // ✅ HOME (misma pantalla + admin asigna cuenta)
@@ -245,7 +239,6 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
     var isAdmin = ctx.User?.IsInRole("admin") == true;
 
-    // Box fijo (se completa por JS con /api/transfers/me/account)
     var accountBoxHtml = """
 <div class='accountBox' id='accountBox'>
   <div class='kv'>
@@ -320,8 +313,7 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 </div>
 """ : "";
 
-    // ✅ Usamos $$""" """ porque hay { } en el JS
-    var html = $$"""
+    var html = """
 <!doctype html>
 <html lang='es'>
 <head>
@@ -329,60 +321,23 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>MP Transferencias</title>
 <style>
-:root{
-  --bg:#0b1220; --card:#0f172a; --border:#1f2937;
-  --muted:#94a3b8; --text:#e5e7eb; --accent:#22c55e; --danger:#ef4444;
-}
+:root{--bg:#0b1220;--card:#0f172a;--border:#1f2937;--muted:#94a3b8;--text:#e5e7eb;--accent:#22c55e;--danger:#ef4444;}
 *{box-sizing:border-box}
-body{
-  margin:0;
-  font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
-  background:radial-gradient(1200px 600px at 20% -10%, rgba(34,197,94,.15), transparent),
-             radial-gradient(900px 500px at 100% 0%, rgba(59,130,246,.12), transparent),
-             var(--bg);
-  color:var(--text);
-}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:radial-gradient(1200px 600px at 20% -10%, rgba(34,197,94,.15), transparent),radial-gradient(900px 500px at 100% 0%, rgba(59,130,246,.12), transparent),var(--bg);color:var(--text);}
 .container{max-width:1200px;margin:18px auto;padding:0 14px 80px}
-.card{
-  background:linear-gradient(180deg, rgba(255,255,255,.03), transparent), var(--card);
-  border:1px solid var(--border); border-radius:18px;
-  box-shadow:0 10px 30px rgba(0,0,0,.25); overflow:hidden;
-}
-.header{
-  padding:18px 18px 14px;
-  background:linear-gradient(90deg, rgba(34,197,94,.16), transparent 60%);
-  border-bottom:1px solid var(--border);
-}
+.card{background:linear-gradient(180deg, rgba(255,255,255,.03), transparent), var(--card);border:1px solid var(--border);border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,.25);overflow:hidden;}
+.header{padding:18px 18px 14px;background:linear-gradient(90deg, rgba(34,197,94,.16), transparent 60%);border-bottom:1px solid var(--border);}
 .titleRow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
 h1{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}
 .sub{margin-top:6px;color:rgba(226,232,240,.9);font-size:14px;font-weight:600}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
-.accountBox{
-  margin-top:14px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px;
-  padding:14px; background:rgba(255,255,255,.03);
-  border:1px solid rgba(148,163,184,.18); border-radius:14px;
-}
-.kv{
-  display:flex;flex-direction:column;gap:6px;
-  padding:12px 14px;border-radius:12px;
-  background:linear-gradient(180deg, rgba(34,197,94,.12), rgba(255,255,255,.02));
-  border:1px solid rgba(34,197,94,.22);
-}
+.accountBox{margin-top:14px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:14px;background:rgba(255,255,255,.03);border:1px solid rgba(148,163,184,.18);border-radius:14px;}
+.kv{display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-radius:12px;background:linear-gradient(180deg, rgba(34,197,94,.12), rgba(255,255,255,.02));border:1px solid rgba(34,197,94,.22);}
 .k{color:rgba(226,232,240,.85);font-size:12px;letter-spacing:.8px;text-transform:uppercase;font-weight:800}
 .v{font-weight:900;font-size:18px;word-break:break-all}
-.sectionTitle{
-  display:flex;justify-content:space-between;align-items:center;
-  padding:14px 18px;border-top:1px solid var(--border);
-  background:rgba(255,255,255,.02);
-}
+.sectionTitle{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-top:1px solid var(--border);background:rgba(255,255,255,.02);}
 .sectionTitle h2{margin:0;font-size:16px;font-weight:900;letter-spacing:.2px}
-.badge{
-  display:inline-flex;align-items:center;gap:8px;
-  padding:6px 10px;border-radius:999px;
-  border:1px solid rgba(255,255,255,.08);
-  color:#cbd5e1;background:rgba(255,255,255,.03);
-  font-size:12px;font-weight:800;
-}
+.badge{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.08);color:#cbd5e1;background:rgba(255,255,255,.03);font-size:12px;font-weight:800;}
 .badge b{color:#fff}
 .tableWrap{overflow:auto}
 table{width:100%;border-collapse:collapse;min-width:860px}
@@ -395,57 +350,17 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 .ok{background:rgba(34,197,94,.18);color:#bbf7d0}
 .bad{background:rgba(239,68,68,.18);color:#fecaca}
 .muted{color:var(--muted)}
-.btn{
-  cursor:pointer; padding:8px 12px; border-radius:12px;
-  border:1px solid rgba(34,197,94,.35);
-  background:rgba(34,197,94,.12);
-  color:#bbf7d0;font-weight:900;
-}
+.btn{cursor:pointer;padding:8px 12px;border-radius:12px;border:1px solid rgba(34,197,94,.35);background:rgba(34,197,94,.12);color:#bbf7d0;font-weight:900;}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.btnDanger{
-  border:1px solid rgba(239,68,68,.35);
-  background:rgba(239,68,68,.10);
-  color:#fecaca;
-}
-.errorBox{
-  padding:12px 14px;border-radius:12px;
-  border:1px solid rgba(239,68,68,.35);
-  background:rgba(239,68,68,.08);color:#fecaca;font-size:14px;
-}
-.footer{
-  position:fixed;bottom:0;left:0;right:0;padding:12px 14px;text-align:center;
-  color:rgba(148,163,184,.85);font-size:12px;
-  background:rgba(11,18,32,.75);backdrop-filter:blur(8px);
-  border-top:1px solid rgba(31,41,55,.7)
-}
+.btnDanger{border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.10);color:#fecaca;}
+.errorBox{padding:12px 14px;border-radius:12px;border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.08);color:#fecaca;font-size:14px;}
+.footer{position:fixed;bottom:0;left:0;right:0;padding:12px 14px;text-align:center;color:rgba(148,163,184,.85);font-size:12px;background:rgba(11,18,32,.75);backdrop-filter:blur(8px);border-top:1px solid rgba(31,41,55,.7)}
 .brand{color:#e5e7eb;font-weight:800}
-
-/* ADMIN */
-.adminTitle{
-  background:linear-gradient(90deg, rgba(59,130,246,.18), transparent 60%);
-}
-.adminBar{
-  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-  padding:12px 18px;
-  border-top:1px solid var(--border);
-  background:rgba(255,255,255,.015);
-}
+.adminTitle{background:linear-gradient(90deg, rgba(59,130,246,.18), transparent 60%);}
+.adminBar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 18px;border-top:1px solid var(--border);background:rgba(255,255,255,.015);}
 .adminLbl{font-weight:800;color:#cbd5e1;font-size:13px}
-.adminInput{
-  background:rgba(255,255,255,.03);
-  border:1px solid rgba(148,163,184,.25);
-  color:#e5e7eb;
-  padding:8px 10px;
-  border-radius:12px;
-  font-weight:800;
-}
-
-@media (max-width: 700px){
-  h1{font-size:24px}
-  .accountBox{grid-template-columns:1fr}
-  .v{font-size:16px}
-  table{min-width:740px}
-}
+.adminInput{background:rgba(255,255,255,.03);border:1px solid rgba(148,163,184,.25);color:#e5e7eb;padding:8px 10px;border-radius:12px;font-weight:800;}
+@media (max-width: 700px){h1{font-size:24px}.accountBox{grid-template-columns:1fr}.v{font-size:16px}table{min-width:740px}}
 </style>
 </head>
 <body>
@@ -459,116 +374,55 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
       {{accountBoxHtml}}
     </div>
 
-    <div class='sectionTitle'>
-      <h2>Pendientes</h2>
-      <div class='badge'>Actualizando…</div>
-    </div>
-
+    <div class='sectionTitle'><h2>Pendientes</h2><div class='badge'>Actualizando…</div></div>
     <div class='tableWrap'>
       <table>
-        <thead>
-          <tr>
-            <th>✅</th>
-            <th>Fecha (AR)</th>
-            <th>Monto</th>
-            <th>Medio</th>
-            <th>Estado</th>
-            <th class='muted'>Payment ID</th>
-          </tr>
-        </thead>
-        <tbody id='pendingBody'>
-          <tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>
-        </tbody>
+        <thead><tr><th>✅</th><th>Fecha (AR)</th><th>Monto</th><th>Medio</th><th>Estado</th><th class='muted'>Payment ID</th></tr></thead>
+        <tbody id='pendingBody'><tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr></tbody>
       </table>
     </div>
 
-    <div class='sectionTitle'>
-      <h2>Aceptadas hoy (por vos)</h2>
-      <div class='badge'>Total hoy: <b id='totalHoy'>$0</b> · Cant: <b id='cantHoy'>0</b></div>
-    </div>
-
+    <div class='sectionTitle'><h2>Aceptadas hoy (por vos)</h2><div class='badge'>Total hoy: <b id='totalHoy'>$0</b> · Cant: <b id='cantHoy'>0</b></div></div>
     <div class='tableWrap'>
       <table>
-        <thead>
-          <tr>
-            <th>Hora (AR)</th>
-            <th>Monto</th>
-            <th>Medio</th>
-            <th>Estado</th>
-            <th class='muted'>Payment ID</th>
-          </tr>
-        </thead>
-        <tbody id='acceptedBody'>
-          <tr><td colspan='5'><div class='errorBox'>Cargando…</div></td></tr>
-        </tbody>
+        <thead><tr><th>Hora (AR)</th><th>Monto</th><th>Medio</th><th>Estado</th><th class='muted'>Payment ID</th></tr></thead>
+        <tbody id='acceptedBody'><tr><td colspan='5'><div class='errorBox'>Cargando…</div></td></tr></tbody>
       </table>
     </div>
 
     {{adminHtml}}
-
   </div>
 </div>
-
 <div class='footer'>By <span class='brand'>PS3 Larroque</span></div>
 
 <script>
 const arMoney = new Intl.NumberFormat('es-AR', { style:'currency', currency:'ARS' });
+function pillClass(status){ if(!status) return 'bad'; const s=(status||'').toLowerCase(); return (s==='approved'||s==='accredited')?'ok':'bad'; }
+function toArDate(iso){ try{ const d=new Date(iso); const pad=(n)=>String(n).padStart(2,'0'); return pad(d.getDate())+'/'+pad(d.getMonth()+1)+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }catch{ return iso; } }
 
-function pillClass(status) {
-  if (!status) return 'bad';
-  const s = status.toLowerCase();
-  return (s === 'approved' || s === 'accredited') ? 'ok' : 'bad';
-}
-
-function toArDate(iso) {
-  try {
-    const d = new Date(iso);
-    const pad = (n)=> String(n).padStart(2,'0');
-    return pad(d.getDate()) + '/' + pad(d.getMonth()+1) + ' ' +
-           pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-  } catch {
-    return iso;
+async function loadMyAccountBox(){
+  try{
+    const r=await fetch('/api/transfers/me/account');
+    const j=await r.json();
+    if(!r.ok||!j.ok) throw new Error(j?.message||'Error me/account');
+    document.getElementById('accNombre').textContent=j.nombre||'—';
+    document.getElementById('accAlias').textContent=j.alias||'—';
+    document.getElementById('accCvu').textContent=j.cvu||'—';
+  }catch{
+    const n=document.getElementById('accNombre'); if(n) n.textContent='Sin cuenta asignada';
+    const a=document.getElementById('accAlias'); if(a) a.textContent='—';
+    const c=document.getElementById('accCvu'); if(c) c.textContent='—';
   }
 }
 
-// ===== Cuenta asignada (Alias/CVU) =====
-async function loadMyAccountBox() {
-  try {
-    const r = await fetch('/api/transfers/me/account');
-    const j = await r.json();
-    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error me/account');
-
-    const n = document.getElementById('accNombre');
-    const a = document.getElementById('accAlias');
-    const c = document.getElementById('accCvu');
-
-    if (n) n.textContent = j.nombre || '—';
-    if (a) a.textContent = j.alias || '—';
-    if (c) c.textContent = j.cvu || '—';
-  } catch (e) {
-    const n = document.getElementById('accNombre');
-    const a = document.getElementById('accAlias');
-    const c = document.getElementById('accCvu');
-    if (n) n.textContent = 'Sin cuenta asignada';
-    if (a) a.textContent = '—';
-    if (c) c.textContent = '—';
-  }
-}
-
-async function loadPending() {
-  const body = document.getElementById('pendingBody');
-  try {
-    const r = await fetch('/api/transfers/pending?limit=20');
-    const j = await r.json();
-
-    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error pending');
-
-    if (!j.items || j.items.length === 0) {
-      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay transferencias pendientes.</div></td></tr>`;
-      return;
-    }
-
-    body.innerHTML = j.items.map(x => `
+async function loadPending(){
+  const body=document.getElementById('pendingBody');
+  try{
+    const r=await fetch('/api/transfers/pending?limit=20');
+    const j=await r.json();
+    if(!r.ok||!j.ok) throw new Error(j?.message||'Error pending');
+    if(!j.items||j.items.length===0){ body.innerHTML=`<tr><td colspan='6'><div class='errorBox'>No hay transferencias pendientes.</div></td></tr>`; return; }
+    body.innerHTML=j.items.map(x=>`
       <tr data-id='${x.id}'>
         <td><button class='btn' onclick='ackTransfer(${x.id}, this)'>Aceptar</button></td>
         <td class='mono'>${toArDate(x.fecha_utc)}</td>
@@ -576,220 +430,152 @@ async function loadPending() {
         <td>${x.payment_type}</td>
         <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
         <td class='muted mono'>${x.payment_id}</td>
-      </tr>
-    `).join('');
-  } catch (e) {
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando pendientes: ${e.message}</div></td></tr>`;
+      </tr>`).join('');
+  }catch(e){
+    body.innerHTML=`<tr><td colspan='6'><div class='errorBox'>Error cargando pendientes: ${e.message}</div></td></tr>`;
   }
 }
 
-async function loadAcceptedToday() {
-  const body = document.getElementById('acceptedBody');
-  const total = document.getElementById('totalHoy');
-  const cant = document.getElementById('cantHoy');
-
-  try {
-    const r = await fetch('/api/transfers/accepted/today');
-    const j = await r.json();
-
-    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error accepted/today');
-
-    total.textContent = arMoney.format(j.total || 0);
-    cant.textContent = (j.count || 0);
-
-    if (!j.items || j.items.length === 0) {
-      body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Todavía no aceptaste transferencias hoy.</div></td></tr>`;
-      return;
-    }
-
-    body.innerHTML = j.items.map(x => `
+async function loadAcceptedToday(){
+  const body=document.getElementById('acceptedBody');
+  const total=document.getElementById('totalHoy');
+  const cant=document.getElementById('cantHoy');
+  try{
+    const r=await fetch('/api/transfers/accepted/today');
+    const j=await r.json();
+    if(!r.ok||!j.ok) throw new Error(j?.message||'Error accepted/today');
+    total.textContent=arMoney.format(j.total||0);
+    cant.textContent=(j.count||0);
+    if(!j.items||j.items.length===0){ body.innerHTML=`<tr><td colspan='5'><div class='errorBox'>Todavía no aceptaste transferencias hoy.</div></td></tr>`; return; }
+    body.innerHTML=j.items.map(x=>`
       <tr>
         <td class='mono'>${toArDate(x.fecha_utc)}</td>
         <td class='money'>${arMoney.format(x.monto)}</td>
         <td>${x.payment_type}</td>
         <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
         <td class='muted mono'>${x.payment_id}</td>
-      </tr>
-    `).join('');
-  } catch (e) {
-    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Error cargando aceptadas: ${e.message}</div></td></tr>`;
-    total.textContent = '$0';
-    cant.textContent = '0';
+      </tr>`).join('');
+  }catch(e){
+    body.innerHTML=`<tr><td colspan='5'><div class='errorBox'>Error cargando aceptadas: ${e.message}</div></td></tr>`;
+    total.textContent='$0'; cant.textContent='0';
   }
 }
 
-async function ackTransfer(id, btn) {
-  try {
-    btn.disabled = true;
-    const r = await fetch(`/api/transfers/${id}/ack`, { method: 'POST' });
-
-    if (r.status === 409) {
-      btn.classList.add('btnDanger');
-      btn.textContent = 'Ya tomada';
-      await refreshAll();
-      return;
-    }
-
-    if (!r.ok) {
-      const t = await r.text();
-      throw new Error(t || 'Error aceptando');
-    }
-
+async function ackTransfer(id, btn){
+  try{
+    btn.disabled=true;
+    const r=await fetch(`/api/transfers/${id}/ack`,{method:'POST'});
+    if(r.status===409){ btn.classList.add('btnDanger'); btn.textContent='Ya tomada'; await refreshAll(); return; }
+    if(!r.ok){ const t=await r.text(); throw new Error(t||'Error aceptando'); }
     await refreshAll();
-  } catch (e) {
-    btn.disabled = false;
-    alert('Error al aceptar: ' + e.message);
+  }catch(e){
+    btn.disabled=false;
+    alert('Error al aceptar: '+e.message);
   }
 }
+
+async function refreshAll(){ await loadPending(); await loadAcceptedToday(); }
 
 // ===== ADMIN =====
-async function loadAdminSucursales() {
-  const sel = document.getElementById('adminSucursal');
-  if (!sel) return;
-
-  try {
-    const r = await fetch('/api/transfers/admin/sucursales');
-    const j = await r.json();
-    if (!r.ok || !j.ok) return;
-
-    const options = (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
-    sel.innerHTML = `<option value=''>Todas</option>` + options;
-  } catch {}
+function setAdminDefaultDateToday(){
+  const input=document.getElementById('adminDate'); if(!input) return;
+  const now=new Date(); const yyyy=now.getFullYear();
+  const mm=String(now.getMonth()+1).padStart(2,'0');
+  const dd=String(now.getDate()).padStart(2,'0');
+  input.value=`${yyyy}-${mm}-${dd}`;
 }
 
-async function loadAdminAcceptedByDay() {
-  const input = document.getElementById('adminDate');
-  const sel = document.getElementById('adminSucursal');
-  const body = document.getElementById('adminAcceptedBody');
-  const total = document.getElementById('adminTotal');
-  const cant = document.getElementById('adminCant');
-  const hint = document.getElementById('adminHint');
+async function loadAdminSucursales(){
+  const sel=document.getElementById('adminSucursal'); if(!sel) return;
+  try{
+    const r=await fetch('/api/transfers/admin/sucursales');
+    const j=await r.json();
+    if(!r.ok||!j.ok) return;
+    sel.innerHTML=`<option value=''>Todas</option>`+(j.items||[]).map(u=>`<option value="${u}">${u}</option>`).join('');
+  }catch{}
+}
 
-  if (!input || !body) return;
-
-  const date = input.value;
-  const suc = sel ? sel.value : "";
-
-  if (!date) {
-    if (hint) hint.textContent = 'Elegí una fecha.';
-    return;
-  }
-  if (hint) hint.textContent = '';
-
-  try {
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>`;
-
-    let url = `/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`;
-    if (suc) url += `&sucursal=${encodeURIComponent(suc)}`;
-
-    const r = await fetch(url);
-    const j = await r.json();
-
-    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error admin accepted/by-day');
-
-    if (total) total.textContent = arMoney.format(j.total || 0);
-    if (cant) cant.textContent = (j.count || 0);
-
-    if (!j.items || j.items.length === 0) {
-      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese filtro.</div></td></tr>`;
-      return;
-    }
-
-    body.innerHTML = j.items.map(x => `
+async function loadAdminAcceptedByDay(){
+  const input=document.getElementById('adminDate');
+  const sel=document.getElementById('adminSucursal');
+  const body=document.getElementById('adminAcceptedBody');
+  const total=document.getElementById('adminTotal');
+  const cant=document.getElementById('adminCant');
+  const hint=document.getElementById('adminHint');
+  if(!input||!body) return;
+  const date=input.value;
+  const suc=sel?sel.value:"";
+  if(!date){ if(hint) hint.textContent='Elegí una fecha.'; return; }
+  if(hint) hint.textContent='';
+  try{
+    body.innerHTML=`<tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>`;
+    let url=`/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`;
+    if(suc) url+=`&sucursal=${encodeURIComponent(suc)}`;
+    const r=await fetch(url);
+    const j=await r.json();
+    if(!r.ok||!j.ok) throw new Error(j?.message||'Error admin accepted/by-day');
+    if(total) total.textContent=arMoney.format(j.total||0);
+    if(cant) cant.textContent=(j.count||0);
+    if(!j.items||j.items.length===0){ body.innerHTML=`<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese filtro.</div></td></tr>`; return; }
+    body.innerHTML=j.items.map(x=>`
       <tr>
         <td class='mono'>${toArDate(x.fecha_utc)}</td>
         <td class='money'>${arMoney.format(x.monto)}</td>
         <td>${x.payment_type}</td>
         <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
-        <td class='mono'>${x.accepted_by || ''}</td>
+        <td class='mono'>${x.accepted_by||''}</td>
         <td class='muted mono'>${x.payment_id}</td>
-      </tr>
-    `).join('');
-  } catch (e) {
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
-    if (total) total.textContent = '$0';
-    if (cant) cant.textContent = '0';
+      </tr>`).join('');
+  }catch(e){
+    body.innerHTML=`<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
+    if(total) total.textContent='$0';
+    if(cant) cant.textContent='0';
   }
 }
 
-function setAdminDefaultDateToday() {
-  const input = document.getElementById('adminDate');
-  if (!input) return;
-  const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth()+1).padStart(2,'0');
-  const dd = String(now.getDate()).padStart(2,'0');
-  input.value = `${yyyy}-${mm}-${dd}`;
+// ADMIN: Asignar cuenta
+async function loadAssignSucursales(){
+  const sel=document.getElementById('assignSucursal'); if(!sel) return;
+  try{
+    const r=await fetch('/api/transfers/admin/sucursales');
+    const j=await r.json();
+    if(!r.ok||!j.ok) return;
+    sel.innerHTML=`<option value=''>Elegí sucursal…</option>`+(j.items||[]).map(u=>`<option value="${u}">${u}</option>`).join('');
+  }catch{}
 }
 
-async function refreshAll() {
-  await loadPending();
-  await loadAcceptedToday();
-}
-
-// ===== ADMIN: Asignar cuenta a sucursal =====
-async function loadAssignSucursales() {
-  const sel = document.getElementById('assignSucursal');
-  if (!sel) return;
-
-  try {
-    const r = await fetch('/api/transfers/admin/sucursales');
-    const j = await r.json();
-    if (!r.ok || !j.ok) return;
-
-    sel.innerHTML = `<option value=''>Elegí sucursal…</option>` +
-      (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
-  } catch {}
-}
-
-async function loadMpAccounts() {
-  const sel = document.getElementById('assignMpAccount');
-  if (!sel) return;
-
-  try {
-    const r = await fetch('/api/transfers/admin/mp-accounts');
-    const j = await r.json();
-    if (!r.ok || !j.ok) return;
-
-    const items = j.items || [];
-    const opt = items.map(x => {
-      const label = `${x.id} · ${x.nombre}${x.activa ? '' : ' (inactiva)'}`;
+async function loadMpAccounts(){
+  const sel=document.getElementById('assignMpAccount'); if(!sel) return;
+  try{
+    const r=await fetch('/api/transfers/admin/mp-accounts');
+    const j=await r.json();
+    if(!r.ok||!j.ok) return;
+    sel.innerHTML=`<option value=''>Elegí cuenta…</option>`+(j.items||[]).map(x=>{
+      const label=`${x.id} · ${x.nombre}${x.activa?'':' (inactiva)'}`;
       return `<option value="${x.id}">${label}</option>`;
     }).join('');
-
-    sel.innerHTML = `<option value=''>Elegí cuenta…</option>` + opt;
-  } catch {}
+  }catch{}
 }
 
-async function assignMpAccountToSucursal() {
-  const suc = document.getElementById('assignSucursal')?.value || '';
-  const acc = document.getElementById('assignMpAccount')?.value || '';
-  const badge = document.getElementById('assignStatus');
-
-  if (!suc || !acc) {
-    if (badge) badge.textContent = 'Elegí sucursal y cuenta';
-    return;
-  }
-
-  try {
-    if (badge) badge.textContent = 'Asignando...';
-
-    const r = await fetch('/api/transfers/admin/assign-mp-account', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: suc, mpAccountId: Number(acc) })
+async function assignMpAccountToSucursal(){
+  const suc=document.getElementById('assignSucursal')?.value||'';
+  const acc=document.getElementById('assignMpAccount')?.value||'';
+  const badge=document.getElementById('assignStatus');
+  if(!suc||!acc){ if(badge) badge.textContent='Elegí sucursal y cuenta'; return; }
+  try{
+    if(badge) badge.textContent='Asignando...';
+    const r=await fetch('/api/transfers/admin/assign-mp-account',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ username:suc, mpAccountId:Number(acc) })
     });
-
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error asignando');
-
-    if (badge) badge.textContent = `OK · ${suc} → cuenta ${acc}`;
-
-    // Por si estás probando logueado como sucursal, refrescamos box + listas
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok||!j.ok) throw new Error(j?.message||'Error asignando');
+    if(badge) badge.textContent=`OK · ${suc} → cuenta ${acc}`;
     await loadMyAccountBox();
     await refreshAll();
-  } catch (e) {
-    if (badge) badge.textContent = `Error: ${e.message}`;
+  }catch(e){
+    if(badge) badge.textContent=`Error: ${e.message}`;
   }
 }
 
@@ -798,14 +584,12 @@ loadMyAccountBox();
 refreshAll();
 setInterval(refreshAll, 8000);
 
-// admin init (si no existen elementos, salen solas)
 setAdminDefaultDateToday();
 loadAdminSucursales();
 loadAdminAcceptedByDay();
 loadAssignSucursales();
 loadMpAccounts();
 </script>
-
 </body>
 </html>
 """;
