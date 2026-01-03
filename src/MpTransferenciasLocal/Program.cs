@@ -167,10 +167,6 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-// ================= API =================
-app.MapGet("/api/transfers/ping", () => Results.Ok(new { ok = true }));
-app.MapControllers();
-
 // ================= HOME + HTML =================
 app.MapGet("/", (IConfiguration cfg) =>
 {
