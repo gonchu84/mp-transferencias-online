@@ -130,7 +130,6 @@ static async Task Json401(HttpContext ctx, string msg)
 var app = builder.Build();
 
 app.UseRouting();
-app.UseAuthorization();
 
 // ================= AUTH MANUAL (ÚNICO SISTEMA) =================
 app.Use(async (ctx, next) =>
@@ -166,6 +165,11 @@ app.Use(async (ctx, next) =>
 
     await next();
 });
+
+app.UseAuthorization();
+
+// ✅ ESTA ERA LA LÍNEA QUE TE FALTABA (causante del 404)
+app.MapControllers();
 
 // ================= HOME + HTML =================
 app.MapGet("/", (IConfiguration cfg) =>
