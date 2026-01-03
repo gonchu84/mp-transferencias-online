@@ -6,7 +6,7 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ================= ONLINE HOSTING (Render/Docker/VPS) =================
+// ================= HOSTING =================
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5286";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
@@ -35,7 +35,7 @@ else
     Console.WriteLine(" - " + configFromDev);
 }
 
-// ✅ IMPORTANTE: asegurar que las variables de entorno pisan a los JSON
+// ✅ Env vars pisan JSON
 builder.Configuration.AddEnvironmentVariables();
 
 // ================= SERVICES =================
@@ -47,7 +47,7 @@ builder.Services.AddHttpClient("MP", c =>
     c.BaseAddress = new Uri("https://api.mercadopago.com/");
 });
 
-// Polling
+// Polling (tu clase existente)
 builder.Services.AddHostedService<MpPollingService>();
 
 // ================= HELPERS =================
@@ -56,20 +56,15 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
     user = string.Empty;
     pass = string.Empty;
 
-    if (string.IsNullOrWhiteSpace(authHeader))
-        return false;
-
-    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
-        return false;
+    if (string.IsNullOrWhiteSpace(authHeader)) return false;
+    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase)) return false;
 
     try
     {
         var encoded = authHeader["Basic ".Length..].Trim();
         var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
         var parts = decoded.Split(':', 2);
-
-        if (parts.Length != 2)
-            return false;
+        if (parts.Length != 2) return false;
 
         user = parts[0];
         pass = parts[1];
@@ -81,7 +76,7 @@ bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
     }
 }
 
-// 🔧 Normaliza ConnectionString (Render postgres:// o DATABASE_URL)
+// Normaliza ConnectionString (Render postgres:// o DATABASE_URL)
 static string NormalizeConnString(IConfiguration cfg)
 {
     var cs = cfg.GetConnectionString("Db") ?? "";
@@ -121,7 +116,7 @@ static string NormalizeConnString(IConfiguration cfg)
     return cs;
 }
 
-// ✅ Valida usuario/clave contra DB usando BCrypt
+// Valida usuario/clave contra DB usando BCrypt
 static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
     IConfiguration cfg,
     string username,
@@ -152,7 +147,6 @@ static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
     if (string.IsNullOrWhiteSpace(hash))
         return (false, role);
 
-    // BCrypt.Net-Next
     var ok = BCrypt.Net.BCrypt.Verify(password, hash);
     return (ok, role);
 }
@@ -172,11 +166,15 @@ catch (Exception ex)
     Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
 }
 
+// ================= PIPELINE (ARREGLADO) =================
+app.UseRouting();
+
 // ================= AUTH (Basic) - POR DB =================
 app.Use(async (ctx, next) =>
 {
-    // permitir health sin auth
-    if (ctx.Request.Path.StartsWithSegments("/health"))
+    // permitir health + favicon sin auth
+    if (ctx.Request.Path.StartsWithSegments("/health") ||
+        ctx.Request.Path.StartsWithSegments("/favicon.ico"))
     {
         await next();
         return;
@@ -224,28 +222,30 @@ app.Use(async (ctx, next) =>
 
 app.UseAuthorization();
 
+// ✅ Evita 404 de favicon en consola del navegador
+app.MapGet("/favicon.ico", () => Results.NoContent());
+
 // ================= LOG =================
 Console.WriteLine("========================================");
 Console.WriteLine("MPTransferenciasLocal iniciado");
 Console.WriteLine("ContentRootPath: " + builder.Environment.ContentRootPath);
 Console.WriteLine("Config usado: " + (configUsado ?? "(ninguno)"));
-Console.WriteLine("Cuenta: " + (builder.Configuration["Cuenta"] ?? "(null)"));
-Console.WriteLine("Alias: " + (builder.Configuration["Alias"] ?? "(null)"));
-Console.WriteLine("CVU: " + (builder.Configuration["CVU"] ?? "(null)"));
 Console.WriteLine("Auth: DB (app_users + BCrypt)");
 Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
+
+// ✅ IMPORTANTE: sin esto, /api/transfers/* da 404
 app.MapControllers();
 
-// ✅ HOME (Pendientes + Aceptadas hoy + (ADMIN) Asignar cuenta + Aceptadas por día)
+// ✅ HOME (misma pantalla + admin asigna cuenta)
 app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
     var isAdmin = ctx.User?.IsInRole("admin") == true;
 
-    // ✅ Ahora el box de cuenta se llena por JS desde /api/transfers/me/account
+    // Box fijo (se completa por JS con /api/transfers/me/account)
     var accountBoxHtml = """
 <div class='accountBox' id='accountBox'>
   <div class='kv'>
@@ -263,7 +263,6 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 </div>
 """;
 
-    // Bloque ADMIN (HTML) - aparece solo si role=admin
     var adminHtml = isAdmin ? """
 <div class='sectionTitle adminTitle'>
   <h2>ADMIN · Asignar cuenta a sucursal</h2>
@@ -321,7 +320,7 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 </div>
 """ : "";
 
-    // ✅ IMPORTANTE: usamos $$""" ... """ para que NO se rompa con { } del JS
+    // ✅ Usamos $$""" """ porque hay { } en el JS
     var html = $$"""
 <!doctype html>
 <html lang='es'>
@@ -672,10 +671,10 @@ async function loadAdminAcceptedByDay() {
   const suc = sel ? sel.value : "";
 
   if (!date) {
-    hint.textContent = 'Elegí una fecha.';
+    if (hint) hint.textContent = 'Elegí una fecha.';
     return;
   }
-  hint.textContent = '';
+  if (hint) hint.textContent = '';
 
   try {
     body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>`;
@@ -688,8 +687,8 @@ async function loadAdminAcceptedByDay() {
 
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error admin accepted/by-day');
 
-    total.textContent = arMoney.format(j.total || 0);
-    cant.textContent = (j.count || 0);
+    if (total) total.textContent = arMoney.format(j.total || 0);
+    if (cant) cant.textContent = (j.count || 0);
 
     if (!j.items || j.items.length === 0) {
       body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese filtro.</div></td></tr>`;
@@ -708,8 +707,8 @@ async function loadAdminAcceptedByDay() {
     `).join('');
   } catch (e) {
     body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
-    total.textContent = '$0';
-    cant.textContent = '0';
+    if (total) total.textContent = '$0';
+    if (cant) cant.textContent = '0';
   }
 }
 
@@ -799,7 +798,7 @@ loadMyAccountBox();
 refreshAll();
 setInterval(refreshAll, 8000);
 
-// admin init (si no existen elementos, las funciones salen solas)
+// admin init (si no existen elementos, salen solas)
 setAdminDefaultDateToday();
 loadAdminSucursales();
 loadAdminAcceptedByDay();
@@ -811,7 +810,6 @@ loadMpAccounts();
 </html>
 """;
 
-    // inyectamos el bloque admin solo si corresponde
     html = html.Replace("{{adminHtml}}", adminHtml);
     html = html.Replace("{{accountBoxHtml}}", accountBoxHtml);
     html = html.Replace("{{cuenta}}", cuenta);
