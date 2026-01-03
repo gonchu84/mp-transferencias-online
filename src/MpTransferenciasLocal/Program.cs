@@ -149,6 +149,13 @@ static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
     return (ok, role);
 }
 
+static async Task WriteJsonUnauthorized(HttpContext ctx, string message)
+{
+    ctx.Response.StatusCode = 401;
+    ctx.Response.ContentType = "application/json; charset=utf-8";
+    await ctx.Response.WriteAsync($$"""{"ok":false,"message":"{{message}}"}""");
+}
+
 var app = builder.Build();
 
 // ================= DB INIT =================
@@ -167,7 +174,7 @@ catch (Exception ex)
 // ================= PIPELINE =================
 app.UseRouting();
 
-// ✅ LOGS DE REQUEST/RESPONSE (para ver qué endpoint dispara el login)
+// ✅ LOGS DE REQUEST/RESPONSE
 app.Use(async (ctx, next) =>
 {
     var hasAuth = ctx.Request.Headers.ContainsKey("Authorization");
@@ -176,13 +183,13 @@ app.Use(async (ctx, next) =>
     Console.WriteLine($"RESP {ctx.Response.StatusCode} {ctx.Request.Method} {ctx.Request.Path}");
 });
 
-// ✅ Basic Auth solo para "/" y "/api/*"
+// ✅ Basic Auth SOLO para /api (NO para "/")
+// 👉 Esto elimina el popup del navegador por completo.
 app.Use(async (ctx, next) =>
 {
     var path = ctx.Request.Path.Value ?? "";
 
     var needsAuth =
-        path == "/" ||
         path.StartsWith("/api", StringComparison.OrdinalIgnoreCase);
 
     if (!needsAuth)
@@ -195,10 +202,8 @@ app.Use(async (ctx, next) =>
 
     if (!TryGetBasicCredentials(authHeader, out var user, out var pass))
     {
-        Console.WriteLine($"AUTH CHALLENGE (sin header) -> {ctx.Request.Method} {path}");
-        ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
-        ctx.Response.StatusCode = 401;
-        await ctx.Response.WriteAsync("Unauthorized");
+        Console.WriteLine($"AUTH 401 (sin header) -> {ctx.Request.Method} {path}");
+        await WriteJsonUnauthorized(ctx, "Falta Authorization header (Basic).");
         return;
     }
 
@@ -208,10 +213,8 @@ app.Use(async (ctx, next) =>
 
         if (!ok)
         {
-            Console.WriteLine($"AUTH CHALLENGE (credenciales inválidas) user={user} -> {ctx.Request.Method} {path}");
-            ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
-            ctx.Response.StatusCode = 401;
-            await ctx.Response.WriteAsync("Unauthorized");
+            Console.WriteLine($"AUTH 401 (credenciales inválidas) user={user} -> {ctx.Request.Method} {path}");
+            await WriteJsonUnauthorized(ctx, "Credenciales inválidas.");
             return;
         }
 
@@ -229,36 +232,35 @@ app.Use(async (ctx, next) =>
     catch (Exception ex)
     {
         Console.WriteLine("⚠ Auth DB error: " + ex.Message);
-        ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
-        ctx.Response.StatusCode = 401;
-        await ctx.Response.WriteAsync("Unauthorized");
+        await WriteJsonUnauthorized(ctx, "Error validando contra DB.");
     }
 });
 
 app.UseAuthorization();
 
-// ✅ Evita 404 de favicon (y evita popups molestos por assets)
+// ✅ Evita 404 de assets típicos
 app.MapGet("/favicon.ico", () => Results.NoContent());
+app.MapGet("/apple-touch-icon.png", () => Results.NoContent());
+app.MapGet("/site.webmanifest", () => Results.NoContent());
 
 // ================= LOG =================
 Console.WriteLine("========================================");
 Console.WriteLine("MPTransferenciasLocal iniciado");
 Console.WriteLine("ContentRootPath: " + builder.Environment.ContentRootPath);
 Console.WriteLine("Config usado: " + (configUsado ?? "(ninguno)"));
-Console.WriteLine("Auth: Basic + DB (app_users + BCrypt)");
+Console.WriteLine("Auth: Basic + DB (app_users + BCrypt) SOLO /api");
 Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
 
-// ✅ IMPORTANTE: sin esto, /api/transfers/* da 404
+// ✅ Controllers (api/transfers/*)
 app.MapControllers();
 
-// ✅ HOME (misma pantalla + admin asigna cuenta)
-app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
+// ✅ HOME (sin auth; el login lo maneja el JS)
+app.MapGet("/", (IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
-    var isAdmin = ctx.User?.IsInRole("admin") == true;
 
     // Box fijo (se completa por JS con /api/transfers/me/account)
     var accountBoxHtml = """
@@ -278,65 +280,66 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 </div>
 """;
 
-    // Bloque ADMIN (HTML) - aparece solo si role=admin
-    var adminHtml = isAdmin ? """
-<div class='sectionTitle adminTitle'>
-  <h2>ADMIN · Asignar cuenta a sucursal</h2>
-  <div class='badge' id='assignStatus'>—</div>
+    // Admin panel SIEMPRE en HTML pero oculto; se muestra si /api/admin/... responde OK
+    var adminHtml = """
+<div id="adminPanel" style="display:none;">
+  <div class='sectionTitle adminTitle'>
+    <h2>ADMIN · Asignar cuenta a sucursal</h2>
+    <div class='badge' id='assignStatus'>—</div>
+  </div>
+
+  <div class='adminBar'>
+    <label class='adminLbl'>Sucursal</label>
+    <select id='assignSucursal' class='adminInput'>
+      <option value=''>Elegí sucursal…</option>
+    </select>
+
+    <label class='adminLbl'>Cuenta MP</label>
+    <select id='assignMpAccount' class='adminInput'>
+      <option value=''>Elegí cuenta…</option>
+    </select>
+
+    <button class='btn' onclick='assignMpAccountToSucursal()'>Asignar</button>
+  </div>
+
+  <div class='sectionTitle adminTitle' style='border-top:1px solid var(--border);'>
+    <h2>ADMIN · Aceptadas por día (todas)</h2>
+    <div class='badge'>Total: <b id='adminTotal'>$0</b> · Cant: <b id='adminCant'>0</b></div>
+  </div>
+
+  <div class='adminBar'>
+    <label class='adminLbl'>Día</label>
+    <input id='adminDate' type='date' class='adminInput' />
+
+    <label class='adminLbl'>Sucursal</label>
+    <select id='adminSucursal' class='adminInput'>
+      <option value=''>Todas</option>
+    </select>
+
+    <button class='btn' onclick='loadAdminAcceptedByDay()'>Buscar</button>
+    <span class='muted' id='adminHint'></span>
+  </div>
+
+  <div class='tableWrap'>
+    <table>
+      <thead>
+        <tr>
+          <th>Hora (AR)</th>
+          <th>Monto</th>
+          <th>Medio</th>
+          <th>Estado</th>
+          <th>Aceptada por</th>
+          <th class='muted'>Payment ID</th>
+        </tr>
+      </thead>
+      <tbody id='adminAcceptedBody'>
+        <tr><td colspan='6'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
+""";
 
-<div class='adminBar'>
-  <label class='adminLbl'>Sucursal</label>
-  <select id='assignSucursal' class='adminInput'>
-    <option value=''>Elegí sucursal…</option>
-  </select>
-
-  <label class='adminLbl'>Cuenta MP</label>
-  <select id='assignMpAccount' class='adminInput'>
-    <option value=''>Elegí cuenta…</option>
-  </select>
-
-  <button class='btn' onclick='assignMpAccountToSucursal()'>Asignar</button>
-</div>
-
-<div class='sectionTitle adminTitle' style='border-top:1px solid var(--border);'>
-  <h2>ADMIN · Aceptadas por día (todas)</h2>
-  <div class='badge'>Total: <b id='adminTotal'>$0</b> · Cant: <b id='adminCant'>0</b></div>
-</div>
-
-<div class='adminBar'>
-  <label class='adminLbl'>Día</label>
-  <input id='adminDate' type='date' class='adminInput' />
-
-  <label class='adminLbl'>Sucursal</label>
-  <select id='adminSucursal' class='adminInput'>
-    <option value=''>Todas</option>
-  </select>
-
-  <button class='btn' onclick='loadAdminAcceptedByDay()'>Buscar</button>
-  <span class='muted' id='adminHint'></span>
-</div>
-
-<div class='tableWrap'>
-  <table>
-    <thead>
-      <tr>
-        <th>Hora (AR)</th>
-        <th>Monto</th>
-        <th>Medio</th>
-        <th>Estado</th>
-        <th>Aceptada por</th>
-        <th class='muted'>Payment ID</th>
-      </tr>
-    </thead>
-    <tbody id='adminAcceptedBody'>
-      <tr><td colspan='6'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
-    </tbody>
-  </table>
-</div>
-""" : "";
-
-    // ✅ NO interpolado (para evitar problemas de llaves)
     var html = """
 <!doctype html>
 <html lang='es'>
@@ -456,6 +459,34 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
   font-weight:800;
 }
 
+/* LOGIN MODAL */
+#loginOverlay{
+  position:fixed; inset:0;
+  background:rgba(0,0,0,.55);
+  display:none; align-items:center; justify-content:center;
+  z-index:9999;
+}
+#loginCard{
+  width:min(420px, calc(100% - 28px));
+  background:linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+  border:1px solid rgba(148,163,184,.25);
+  border-radius:16px;
+  box-shadow:0 20px 60px rgba(0,0,0,.45);
+  padding:16px;
+}
+.loginTitle{font-size:18px;font-weight:900;margin:0 0 8px}
+.loginSub{color:rgba(226,232,240,.85);font-size:13px;margin:0 0 14px}
+.loginRow{display:flex;flex-direction:column;gap:6px;margin-bottom:10px}
+.loginRow label{font-weight:800;color:#cbd5e1;font-size:12px}
+.loginRow input{
+  padding:10px 12px;border-radius:12px;
+  border:1px solid rgba(148,163,184,.25);
+  background:rgba(0,0,0,.18);
+  color:#e5e7eb;
+  font-weight:800;
+}
+.loginActions{display:flex;gap:10px;justify-content:flex-end;margin-top:10px}
+.loginErr{margin-top:10px;display:none}
 @media (max-width: 700px){
   h1{font-size:24px}
   .accountBox{grid-template-columns:1fr}
@@ -465,6 +496,31 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 </style>
 </head>
 <body>
+
+<div id="loginOverlay">
+  <div id="loginCard">
+    <p class="loginTitle">Iniciar sesión</p>
+    <p class="loginSub">Ingresá tu usuario y contraseña para ver y aceptar transferencias.</p>
+
+    <div class="loginRow">
+      <label for="loginUser">Usuario</label>
+      <input id="loginUser" autocomplete="username" />
+    </div>
+
+    <div class="loginRow">
+      <label for="loginPass">Contraseña</label>
+      <input id="loginPass" type="password" autocomplete="current-password" />
+    </div>
+
+    <div class="loginActions">
+      <button class="btn btnDanger" onclick="logout()">Cancelar</button>
+      <button class="btn" onclick="doLogin()">Entrar</button>
+    </div>
+
+    <div id="loginErr" class="errorBox loginErr"></div>
+  </div>
+</div>
+
 <div class='container'>
   <div class='card'>
     <div class='header'>
@@ -530,6 +586,85 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 <script>
 const arMoney = new Intl.NumberFormat('es-AR', { style:'currency', currency:'ARS' });
 
+// === AUTH (Modal) ===
+// Dura mientras la pestaña está abierta.
+// Si querés persistir aun cerrando navegador: sessionStorage -> localStorage
+const STORE = sessionStorage;
+let AUTH = STORE.getItem('basicAuthHeader') || '';
+
+function showLogin(msg) {
+  const ov = document.getElementById('loginOverlay');
+  const err = document.getElementById('loginErr');
+  if (msg) {
+    err.style.display = 'block';
+    err.textContent = msg;
+  } else {
+    err.style.display = 'none';
+    err.textContent = '';
+  }
+  ov.style.display = 'flex';
+  setTimeout(()=> document.getElementById('loginUser')?.focus(), 50);
+}
+
+function hideLogin() {
+  document.getElementById('loginOverlay').style.display = 'none';
+}
+
+function buildBasicAuth(user, pass) {
+  return 'Basic ' + btoa(`${user}:${pass}`);
+}
+
+async function api(url, options = {}) {
+  const headers = {
+    ...(options.headers || {}),
+    ...(AUTH ? { 'Authorization': AUTH } : {})
+  };
+
+  const res = await fetch(url, { ...options, headers });
+
+  if (res.status === 401) {
+    // auth inválida -> volver a pedir sin loop
+    AUTH = '';
+    STORE.removeItem('basicAuthHeader');
+    showLogin('Usuario/clave inválidos. Probá de nuevo.');
+    throw new Error('401 Unauthorized');
+  }
+
+  return res;
+}
+
+async function doLogin() {
+  const u = (document.getElementById('loginUser')?.value || '').trim();
+  const p = (document.getElementById('loginPass')?.value || '').trim();
+  if (!u || !p) return showLogin('Completá usuario y contraseña.');
+
+  AUTH = buildBasicAuth(u, p);
+  STORE.setItem('basicAuthHeader', AUTH);
+
+  // Probar credenciales contra un endpoint protegido
+  try {
+    const r = await api('/api/transfers/ping');
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j?.message || 'Login inválido');
+
+    hideLogin();
+    await initAfterLogin();
+  } catch (e) {
+    // api() ya vuelve a mostrar el login si fue 401
+    if (String(e.message || '').includes('Login inválido')) {
+      AUTH = '';
+      STORE.removeItem('basicAuthHeader');
+      showLogin('Usuario/clave inválidos.');
+    }
+  }
+}
+
+function logout() {
+  AUTH = '';
+  STORE.removeItem('basicAuthHeader');
+  showLogin('Ingresá tus credenciales.');
+}
+
 function pillClass(status) {
   if (!status) return 'bad';
   const s = status.toLowerCase();
@@ -547,73 +682,21 @@ function toArDate(iso) {
   }
 }
 
-// =======================
-// ✅ AUTH (Opción B)
-// =======================
-// Se guarda en sessionStorage para que NO pregunte todo el tiempo.
-// Si querés que persista aun cerrando el navegador, cambiá sessionStorage -> localStorage.
-function buildBasicAuth(user, pass) {
-  return 'Basic ' + btoa(`${user}:${pass}`);
-}
-
-function getOrAskAuthHeader() {
-  let h = sessionStorage.getItem('basicAuthHeader');
-  if (h && h.startsWith('Basic ')) return h;
-
-  const user = prompt('Usuario:');
-  if (!user) return null;
-
-  const pass = prompt('Clave:');
-  if (pass === null) return null;
-
-  h = buildBasicAuth(user, pass);
-  sessionStorage.setItem('basicAuthHeader', h);
-  return h;
-}
-
-let AUTH = getOrAskAuthHeader();
-if (!AUTH) {
-  document.body.innerHTML = "<div style='padding:20px;color:#fff;font-family:system-ui'>Login cancelado.</div>";
-  throw new Error("Login cancelado");
-}
-
-// Helper fetch que SIEMPRE manda Authorization
-async function api(url, options = {}) {
-  const headers = {
-    ...(options.headers || {}),
-    'Authorization': AUTH
-  };
-
-  const res = await fetch(url, { ...options, headers });
-
-  // Si por alguna razón quedó auth vieja, la borramos y recargamos
-  if (res.status === 401) {
-    sessionStorage.removeItem('basicAuthHeader');
-    alert('Sesión inválida. Volvé a ingresar usuario/clave.');
-    location.reload();
-  }
-
-  return res;
-}
-
 // ===== Cuenta asignada (Alias/CVU) =====
 async function loadMyAccountBox() {
+  const n = document.getElementById('accNombre');
+  const a = document.getElementById('accAlias');
+  const c = document.getElementById('accCvu');
+
   try {
     const r = await api('/api/transfers/me/account');
     const j = await r.json();
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error me/account');
 
-    const n = document.getElementById('accNombre');
-    const a = document.getElementById('accAlias');
-    const c = document.getElementById('accCvu');
-
     if (n) n.textContent = j.nombre || '—';
     if (a) a.textContent = j.alias || '—';
     if (c) c.textContent = j.cvu || '—';
-  } catch (e) {
-    const n = document.getElementById('accNombre');
-    const a = document.getElementById('accAlias');
-    const c = document.getElementById('accCvu');
+  } catch {
     if (n) n.textContent = 'Sin cuenta asignada';
     if (a) a.textContent = '—';
     if (c) c.textContent = '—';
@@ -625,7 +708,6 @@ async function loadPending() {
   try {
     const r = await api('/api/transfers/pending?limit=20');
     const j = await r.json();
-
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error pending');
 
     if (!j.items || j.items.length === 0) {
@@ -644,7 +726,7 @@ async function loadPending() {
       </tr>
     `).join('');
   } catch (e) {
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando pendientes: ${e.message}</div></td></tr>`;
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando pendientes.</div></td></tr>`;
   }
 }
 
@@ -656,7 +738,6 @@ async function loadAcceptedToday() {
   try {
     const r = await api('/api/transfers/accepted/today');
     const j = await r.json();
-
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error accepted/today');
 
     total.textContent = arMoney.format(j.total || 0);
@@ -676,8 +757,8 @@ async function loadAcceptedToday() {
         <td class='muted mono'>${x.payment_id}</td>
       </tr>
     `).join('');
-  } catch (e) {
-    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Error cargando aceptadas: ${e.message}</div></td></tr>`;
+  } catch {
+    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Error cargando aceptadas.</div></td></tr>`;
     total.textContent = '$0';
     cant.textContent = '0';
   }
@@ -686,7 +767,6 @@ async function loadAcceptedToday() {
 async function ackTransfer(id, btn) {
   try {
     btn.disabled = true;
-
     const r = await api(`/api/transfers/${id}/ack`, { method: 'POST' });
 
     if (r.status === 409) {
@@ -704,20 +784,47 @@ async function ackTransfer(id, btn) {
     await refreshAll();
   } catch (e) {
     btn.disabled = false;
-    alert('Error al aceptar: ' + e.message);
+    alert('Error al aceptar.');
   }
 }
 
 // ===== ADMIN =====
-async function loadAdminSucursales() {
-  const sel = document.getElementById('adminSucursal');
-  if (!sel) return;
+function setAdminDefaultDateToday() {
+  const input = document.getElementById('adminDate');
+  if (!input) return;
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth()+1).padStart(2,'0');
+  const dd = String(now.getDate()).padStart(2,'0');
+  input.value = `${yyyy}-${mm}-${dd}`;
+}
+
+async function tryEnableAdmin() {
+  const panel = document.getElementById('adminPanel');
+  if (!panel) return;
 
   try {
     const r = await api('/api/transfers/admin/sucursales');
     const j = await r.json();
-    if (!r.ok || !j.ok) return;
+    if (!r.ok || !j.ok) throw new Error('not admin');
 
+    panel.style.display = 'block';
+    await loadAdminSucursales(j);
+    await loadAssignSucursales(j);
+    await loadMpAccounts();
+    setAdminDefaultDateToday();
+    await loadAdminAcceptedByDay();
+  } catch {
+    panel.style.display = 'none';
+  }
+}
+
+async function loadAdminSucursales(preloaded) {
+  const sel = document.getElementById('adminSucursal');
+  if (!sel) return;
+
+  try {
+    const j = preloaded || (await (await api('/api/transfers/admin/sucursales')).json());
     const options = (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
     sel.innerHTML = `<option value=''>Todas</option>` + options;
   } catch {}
@@ -750,8 +857,7 @@ async function loadAdminAcceptedByDay() {
 
     const r = await api(url);
     const j = await r.json();
-
-    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error admin accepted/by-day');
+    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error admin');
 
     if (total) total.textContent = arMoney.format(j.total || 0);
     if (cant) cant.textContent = (j.count || 0);
@@ -771,38 +877,20 @@ async function loadAdminAcceptedByDay() {
         <td class='muted mono'>${x.payment_id}</td>
       </tr>
     `).join('');
-  } catch (e) {
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
+  } catch {
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin.</div></td></tr>`;
     if (total) total.textContent = '$0';
     if (cant) cant.textContent = '0';
   }
 }
 
-function setAdminDefaultDateToday() {
-  const input = document.getElementById('adminDate');
-  if (!input) return;
-  const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth()+1).padStart(2,'0');
-  const dd = String(now.getDate()).padStart(2,'0');
-  input.value = `${yyyy}-${mm}-${dd}`;
-}
-
-async function refreshAll() {
-  await loadPending();
-  await loadAcceptedToday();
-}
-
 // ===== ADMIN: Asignar cuenta a sucursal =====
-async function loadAssignSucursales() {
+async function loadAssignSucursales(preloaded) {
   const sel = document.getElementById('assignSucursal');
   if (!sel) return;
 
   try {
-    const r = await api('/api/transfers/admin/sucursales');
-    const j = await r.json();
-    if (!r.ok || !j.ok) return;
-
+    const j = preloaded || (await (await api('/api/transfers/admin/sucursales')).json());
     sel.innerHTML = `<option value=''>Elegí sucursal…</option>` +
       (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
   } catch {}
@@ -853,29 +941,50 @@ async function assignMpAccountToSucursal() {
 
     await loadMyAccountBox();
     await refreshAll();
-  } catch (e) {
-    if (badge) badge.textContent = `Error: ${e.message}`;
+  } catch {
+    if (badge) badge.textContent = `Error asignando`;
   }
 }
 
-// init
-loadMyAccountBox();
-refreshAll();
-setInterval(refreshAll, 8000);
+async function refreshAll() {
+  await loadPending();
+  await loadAcceptedToday();
+}
 
-// admin init (si no existen elementos, las funciones salen solas)
-setAdminDefaultDateToday();
-loadAdminSucursales();
-loadAdminAcceptedByDay();
-loadAssignSucursales();
-loadMpAccounts();
+let timer = null;
+
+async function initAfterLogin() {
+  await loadMyAccountBox();
+  await refreshAll();
+  await tryEnableAdmin();
+
+  if (timer) clearInterval(timer);
+  timer = setInterval(refreshAll, 8000);
+}
+
+// Boot
+if (!AUTH) {
+  showLogin();
+} else {
+  // Si hay auth guardada, probamos y si falla vuelve al login
+  (async ()=>{
+    try {
+      const r = await api('/api/transfers/ping');
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error('bad');
+      await initAfterLogin();
+    } catch {
+      // api() ya maneja 401
+      showLogin();
+    }
+  })();
+}
 </script>
 
 </body>
 </html>
 """;
 
-    // inyectamos valores sin interpolación
     html = html.Replace("__ADMIN_HTML__", adminHtml);
     html = html.Replace("__ACCOUNT_BOX__", accountBoxHtml);
     html = html.Replace("__CUENTA__", cuenta);
