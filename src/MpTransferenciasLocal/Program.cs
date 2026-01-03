@@ -176,7 +176,7 @@ app.Use(async (ctx, next) =>
     Console.WriteLine($"RESP {ctx.Response.StatusCode} {ctx.Request.Method} {ctx.Request.Path}");
 });
 
-// ✅ Opción A bien hecha: Basic Auth solo para "/" y "/api/*"
+// ✅ Basic Auth solo para "/" y "/api/*"
 app.Use(async (ctx, next) =>
 {
     var path = ctx.Request.Path.Value ?? "";
@@ -547,10 +547,59 @@ function toArDate(iso) {
   }
 }
 
+// =======================
+// ✅ AUTH (Opción B)
+// =======================
+// Se guarda en sessionStorage para que NO pregunte todo el tiempo.
+// Si querés que persista aun cerrando el navegador, cambiá sessionStorage -> localStorage.
+function buildBasicAuth(user, pass) {
+  return 'Basic ' + btoa(`${user}:${pass}`);
+}
+
+function getOrAskAuthHeader() {
+  let h = sessionStorage.getItem('basicAuthHeader');
+  if (h && h.startsWith('Basic ')) return h;
+
+  const user = prompt('Usuario:');
+  if (!user) return null;
+
+  const pass = prompt('Clave:');
+  if (pass === null) return null;
+
+  h = buildBasicAuth(user, pass);
+  sessionStorage.setItem('basicAuthHeader', h);
+  return h;
+}
+
+let AUTH = getOrAskAuthHeader();
+if (!AUTH) {
+  document.body.innerHTML = "<div style='padding:20px;color:#fff;font-family:system-ui'>Login cancelado.</div>";
+  throw new Error("Login cancelado");
+}
+
+// Helper fetch que SIEMPRE manda Authorization
+async function api(url, options = {}) {
+  const headers = {
+    ...(options.headers || {}),
+    'Authorization': AUTH
+  };
+
+  const res = await fetch(url, { ...options, headers });
+
+  // Si por alguna razón quedó auth vieja, la borramos y recargamos
+  if (res.status === 401) {
+    sessionStorage.removeItem('basicAuthHeader');
+    alert('Sesión inválida. Volvé a ingresar usuario/clave.');
+    location.reload();
+  }
+
+  return res;
+}
+
 // ===== Cuenta asignada (Alias/CVU) =====
 async function loadMyAccountBox() {
   try {
-    const r = await fetch('/api/transfers/me/account', { credentials: 'same-origin' });
+    const r = await api('/api/transfers/me/account');
     const j = await r.json();
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error me/account');
 
@@ -574,7 +623,7 @@ async function loadMyAccountBox() {
 async function loadPending() {
   const body = document.getElementById('pendingBody');
   try {
-    const r = await fetch('/api/transfers/pending?limit=20', { credentials: 'same-origin' });
+    const r = await api('/api/transfers/pending?limit=20');
     const j = await r.json();
 
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error pending');
@@ -605,7 +654,7 @@ async function loadAcceptedToday() {
   const cant = document.getElementById('cantHoy');
 
   try {
-    const r = await fetch('/api/transfers/accepted/today', { credentials: 'same-origin' });
+    const r = await api('/api/transfers/accepted/today');
     const j = await r.json();
 
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error accepted/today');
@@ -637,7 +686,8 @@ async function loadAcceptedToday() {
 async function ackTransfer(id, btn) {
   try {
     btn.disabled = true;
-    const r = await fetch(`/api/transfers/${id}/ack`, { method: 'POST', credentials: 'same-origin' });
+
+    const r = await api(`/api/transfers/${id}/ack`, { method: 'POST' });
 
     if (r.status === 409) {
       btn.classList.add('btnDanger');
@@ -664,7 +714,7 @@ async function loadAdminSucursales() {
   if (!sel) return;
 
   try {
-    const r = await fetch('/api/transfers/admin/sucursales', { credentials: 'same-origin' });
+    const r = await api('/api/transfers/admin/sucursales');
     const j = await r.json();
     if (!r.ok || !j.ok) return;
 
@@ -698,7 +748,7 @@ async function loadAdminAcceptedByDay() {
     let url = `/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`;
     if (suc) url += `&sucursal=${encodeURIComponent(suc)}`;
 
-    const r = await fetch(url, { credentials: 'same-origin' });
+    const r = await api(url);
     const j = await r.json();
 
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error admin accepted/by-day');
@@ -749,7 +799,7 @@ async function loadAssignSucursales() {
   if (!sel) return;
 
   try {
-    const r = await fetch('/api/transfers/admin/sucursales', { credentials: 'same-origin' });
+    const r = await api('/api/transfers/admin/sucursales');
     const j = await r.json();
     if (!r.ok || !j.ok) return;
 
@@ -763,7 +813,7 @@ async function loadMpAccounts() {
   if (!sel) return;
 
   try {
-    const r = await fetch('/api/transfers/admin/mp-accounts', { credentials: 'same-origin' });
+    const r = await api('/api/transfers/admin/mp-accounts');
     const j = await r.json();
     if (!r.ok || !j.ok) return;
 
@@ -790,10 +840,9 @@ async function assignMpAccountToSucursal() {
   try {
     if (badge) badge.textContent = 'Asignando...';
 
-    const r = await fetch('/api/transfers/admin/assign-mp-account', {
+    const r = await api('/api/transfers/admin/assign-mp-account', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
       body: JSON.stringify({ username: suc, mpAccountId: Number(acc) })
     });
 
