@@ -1,11 +1,13 @@
+using System.Globalization;
 using System.Security.Claims;
 using System.Text;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Hosting;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ================= HOSTING =================
+// ================= ONLINE HOSTING (Render/Docker/VPS) =================
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5286";
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
@@ -34,23 +36,22 @@ else
     Console.WriteLine(" - " + configFromDev);
 }
 
-// ✅ Env vars pisan JSON
+// ✅ IMPORTANTE: asegurar que las variables de entorno pisan a los JSON
 builder.Configuration.AddEnvironmentVariables();
 
 // ================= SERVICES =================
 builder.Services.AddControllers();
 builder.Services.AddAuthorization();
 
-// ✅ NECESARIO para MpPollingService si usa IHttpClientFactory
 builder.Services.AddHttpClient("MP", c =>
 {
     c.BaseAddress = new Uri("https://api.mercadopago.com/");
 });
 
-// si el polling falla, no tirar la app
-builder.Services.Configure<HostOptions>(opts =>
+// Polling (si falla, no tirar abajo el proceso)
+builder.Services.Configure<HostOptions>(o =>
 {
-    opts.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
+    o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
 });
 builder.Services.AddHostedService<MpPollingService>();
 
@@ -60,15 +61,20 @@ static bool TryGetBasicCredentials(string authHeader, out string user, out strin
     user = string.Empty;
     pass = string.Empty;
 
-    if (string.IsNullOrWhiteSpace(authHeader)) return false;
-    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase)) return false;
+    if (string.IsNullOrWhiteSpace(authHeader))
+        return false;
+
+    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+        return false;
 
     try
     {
         var encoded = authHeader["Basic ".Length..].Trim();
         var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(encoded));
         var parts = decoded.Split(':', 2);
-        if (parts.Length != 2) return false;
+
+        if (parts.Length != 2)
+            return false;
 
         user = parts[0];
         pass = parts[1];
@@ -80,6 +86,7 @@ static bool TryGetBasicCredentials(string authHeader, out string user, out strin
     }
 }
 
+// 🔧 Normaliza ConnectionString (Render postgres:// o DATABASE_URL)
 static string NormalizeConnString(IConfiguration cfg)
 {
     var cs = cfg.GetConnectionString("Db") ?? "";
@@ -118,6 +125,7 @@ static string NormalizeConnString(IConfiguration cfg)
         return b.ConnectionString;
     }
 
+    // ya viene en formato Npgsql
     return new NpgsqlConnectionStringBuilder(cs)
     {
         SslMode = SslMode.Require,
@@ -127,50 +135,43 @@ static string NormalizeConnString(IConfiguration cfg)
 }
 
 // ✅ Valida usuario/clave contra DB usando BCrypt
-static async Task<(bool ok, string? role, string reason)> ValidateUserFromDbAsync(
+static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
     IConfiguration cfg,
     string username,
     string password)
 {
-    try
-    {
-        var cs = NormalizeConnString(cfg);
+    var cs = NormalizeConnString(cfg);
 
-        await using var conn = new NpgsqlConnection(cs);
-        await conn.OpenAsync();
+    await using var conn = new NpgsqlConnection(cs);
+    await conn.OpenAsync();
 
-        var sql = """
-            select role, password_hash
-            from app_users
-            where username = @u
-            limit 1;
-        """;
+    var sql = """
+        select role, password_hash
+        from app_users
+        where username = @u
+        limit 1;
+    """;
 
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("u", username);
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("u", username);
 
-        await using var rd = await cmd.ExecuteReaderAsync();
-        if (!await rd.ReadAsync())
-            return (false, null, "Usuario inexistente");
+    await using var rd = await cmd.ExecuteReaderAsync();
+    if (!await rd.ReadAsync())
+        return (false, null);
 
-        var role = rd.IsDBNull(0) ? null : rd.GetString(0);
-        var hash = rd.IsDBNull(1) ? "" : rd.GetString(1);
+    var role = rd.IsDBNull(0) ? null : rd.GetString(0);
+    var hash = rd.IsDBNull(1) ? "" : rd.GetString(1);
 
-        if (string.IsNullOrWhiteSpace(hash))
-            return (false, role, "Usuario sin clave");
+    if (string.IsNullOrWhiteSpace(hash))
+        return (false, role);
 
-        var ok = BCrypt.Net.BCrypt.Verify(password, hash);
-        return ok ? (true, role, "OK") : (false, role, "Clave incorrecta");
-    }
-    catch (Exception ex)
-    {
-        return (false, null, "DB_ERROR: " + ex.Message);
-    }
+    var ok = BCrypt.Net.BCrypt.Verify(password, hash);
+    return (ok, role);
 }
 
+// ✅ 401 JSON SIN WWW-Authenticate => NO popup navegador
 static async Task Json401(HttpContext ctx, string msg)
 {
-    // ✅ CRÍTICO: NO enviar WWW-Authenticate -> NO popup
     ctx.Response.StatusCode = 401;
     ctx.Response.ContentType = "application/json; charset=utf-8";
     await ctx.Response.WriteAsync($$"""{"ok":false,"message":"{{msg}}"}""");
@@ -191,22 +192,21 @@ catch (Exception ex)
     Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
 }
 
-// ================= PIPELINE =================
-app.UseRouting();
-
-// ✅ LOGS (opcional)
+// ================= AUTH (Basic) - POR DB =================
+// ✅ CAMBIO CLAVE: SOLO /api/* y sin WWW-Authenticate (sin popup)
 app.Use(async (ctx, next) =>
 {
-    var hasAuth = ctx.Request.Headers.ContainsKey("Authorization");
-    Console.WriteLine($"REQ  {ctx.Request.Method} {ctx.Request.Path}  AuthHdr={(hasAuth ? "YES" : "NO")}");
-    await next();
-    Console.WriteLine($"RESP {ctx.Response.StatusCode} {ctx.Request.Method} {ctx.Request.Path}");
-});
+    // permitir health y home sin auth
+    if (ctx.Request.Path.StartsWithSegments("/health") ||
+        ctx.Request.Path == "/" ||
+        ctx.Request.Path.StartsWithSegments("/favicon.ico"))
+    {
+        await next();
+        return;
+    }
 
-// ✅ AUTH SOLO PARA /api/* (HOME pública => NO popup)
-app.Use(async (ctx, next) =>
-{
-    if (!ctx.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
+    // solo protegemos /api/*
+    if (!ctx.Request.Path.StartsWithSegments("/api"))
     {
         await next();
         return;
@@ -220,35 +220,50 @@ app.Use(async (ctx, next) =>
         return;
     }
 
-    var (ok, role, reason) = await ValidateUserFromDbAsync(app.Configuration, user, pass);
-    if (!ok)
+    try
     {
-        await Json401(ctx, reason);
-        return;
+        var (ok, role) = await ValidateUserFromDbAsync(app.Configuration, user, pass);
+
+        if (!ok)
+        {
+            await Json401(ctx, "Credenciales inválidas");
+            return;
+        }
+
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.Name, user),
+            new(ClaimTypes.Role, string.IsNullOrWhiteSpace(role) ? "sucursal" : role!)
+        };
+
+        ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
+        await next();
     }
-
-    var claims = new List<Claim>
+    catch (Exception ex)
     {
-        new(ClaimTypes.Name, user),
-        new(ClaimTypes.Role, string.IsNullOrWhiteSpace(role) ? "sucursal" : role!)
-    };
-
-    ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "ManualBasic"));
-    await next();
+        Console.WriteLine("⚠ Auth DB error: " + ex.Message);
+        await Json401(ctx, "Error autenticando");
+    }
 });
 
 app.UseAuthorization();
 
-// ✅ Evita 404 favicon
-app.MapGet("/favicon.ico", () => Results.NoContent());
+// ================= LOG =================
+Console.WriteLine("========================================");
+Console.WriteLine("MPTransferenciasLocal iniciado");
+Console.WriteLine("ContentRootPath: " + builder.Environment.ContentRootPath);
+Console.WriteLine("Config usado: " + (configUsado ?? "(ninguno)"));
+Console.WriteLine("Auth: DB (app_users + BCrypt) · /api protegido · home pública (sin popup)");
+Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
 app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.Now }));
+app.MapGet("/favicon.ico", () => Results.NoContent());
 
-// ✅ Controllers (sin esto /api/transfers/* = 404)
 app.MapControllers();
 
-// ================= HOME (TU HTML + LOGIN OVERLAY + AUTH HEADER) =================
+// ✅ HOME (Pendientes + Aceptadas hoy + ADMIN con estética vieja)
+// Importante: como "/" es público, el ADMIN se muestra/oculta por JS probando endpoints admin
 app.MapGet("/", (IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
@@ -270,13 +285,68 @@ app.MapGet("/", (IConfiguration cfg) =>
 </div>
 """;
 
-    // ✅ Admin HTML se mantiene igual al tuyo (si tu backend lo muestra por rol desde endpoints, no cambiamos nada acá)
-    // Si querés que aparezca/oculte según rol, lo maneja tu JS o el endpoint; acá dejamos el placeholder.
+    // ✅ ESTE es el bloque ADMIN “viejo” (estética vieja)
+    // Lo envolvemos en #adminSection para mostrarlo SOLO si sos admin (por JS)
     var adminHtml = """
-<!-- (ADMIN se renderiza si tu HTML original lo incluye; si no, dejalo vacío) -->
+<div id='adminSection' style='display:none;'>
+  <div class='sectionTitle adminTitle'>
+    <h2>ADMIN · Asignar cuenta a sucursal</h2>
+    <div class='badge' id='assignStatus'>—</div>
+  </div>
+
+  <div class='adminBar'>
+    <label class='adminLbl'>Sucursal</label>
+    <select id='assignSucursal' class='adminInput'>
+      <option value=''>Elegí sucursal…</option>
+    </select>
+
+    <label class='adminLbl'>Cuenta MP</label>
+    <select id='assignMpAccount' class='adminInput'>
+      <option value=''>Elegí cuenta…</option>
+    </select>
+
+    <button class='btn' onclick='assignMpAccountToSucursal()'>Asignar</button>
+  </div>
+
+  <div class='sectionTitle adminTitle' style='border-top:1px solid var(--border);'>
+    <h2>ADMIN · Aceptadas por día (todas)</h2>
+    <div class='badge'>Total: <b id='adminTotal'>$0</b> · Cant: <b id='adminCant'>0</b></div>
+  </div>
+
+  <div class='adminBar'>
+    <label class='adminLbl'>Día</label>
+    <input id='adminDate' type='date' class='adminInput' />
+
+    <label class='adminLbl'>Sucursal</label>
+    <select id='adminSucursal' class='adminInput'>
+      <option value=''>Todas</option>
+    </select>
+
+    <button class='btn' onclick='loadAdminAcceptedByDay()'>Buscar</button>
+    <span class='muted' id='adminHint'></span>
+  </div>
+
+  <div class='tableWrap'>
+    <table>
+      <thead>
+        <tr>
+          <th>Hora (AR)</th>
+          <th>Monto</th>
+          <th>Medio</th>
+          <th>Estado</th>
+          <th>Aceptada por</th>
+          <th class='muted'>Payment ID</th>
+        </tr>
+      </thead>
+      <tbody id='adminAcceptedBody'>
+        <tr><td colspan='6'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
 """;
 
-    var html = """
+    var html = $$"""
 <!doctype html>
 <html lang='es'>
 <head>
@@ -405,7 +475,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 </head>
 <body>
 
-<!-- ✅ Overlay login (mínimo, no cambia tu estética general) -->
+<!-- ✅ LOGIN (sin cambiar estética general) -->
 <div id="loginOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.86);display:none;align-items:center;justify-content:center;z-index:9999;">
   <div style="width:340px;max-width:92vw;background:var(--card);border:1px solid var(--border);border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,.35);padding:16px;">
     <div style="font-weight:900;font-size:18px;margin-bottom:10px;">Iniciar sesión</div>
@@ -421,10 +491,10 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
   <div class='card'>
     <div class='header'>
       <div class='titleRow'>
-        <h1>MP Transferencias · __CUENTA__</h1>
+        <h1>MP Transferencias · {{cuenta}}</h1>
         <div class='sub'>Pendientes (últimas <b>20</b>) · Actualiza cada <b>8</b> segundos</div>
       </div>
-      __ACCOUNT_BOX__
+      {{accountBoxHtml}}
     </div>
 
     <div class='sectionTitle'>
@@ -472,7 +542,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
       </table>
     </div>
 
-    __ADMIN_HTML__
+    {{adminHtml}}
 
   </div>
 </div>
@@ -480,7 +550,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
 <div class='footer'>By <span class='brand'>PS3 Larroque</span></div>
 
 <script>
-// ✅ AUTH por header (no cookies) + SIN popup
+const arMoney = new Intl.NumberFormat('es-AR', { style:'currency', currency:'ARS' });
 let AUTH = sessionStorage.getItem('AUTH') || '';
 
 function b64(s){ return btoa(unescape(encodeURIComponent(s))); }
@@ -497,16 +567,8 @@ function showLogin(msg){
   }
   ov.style.display = 'flex';
 }
-
-function hideLogin(){
-  document.getElementById('loginOverlay').style.display = 'none';
-}
-
-function logout(){
-  AUTH = '';
-  sessionStorage.removeItem('AUTH');
-  showLogin('');
-}
+function hideLogin(){ document.getElementById('loginOverlay').style.display = 'none'; }
+function logout(){ AUTH=''; sessionStorage.removeItem('AUTH'); showLogin(''); }
 
 async function apiFetch(url, opts){
   opts = opts || {};
@@ -515,7 +577,6 @@ async function apiFetch(url, opts){
 
   const r = await fetch(url, opts);
 
-  // si cae 401 => pedimos login overlay
   if (r.status === 401){
     AUTH = '';
     sessionStorage.removeItem('AUTH');
@@ -535,57 +596,44 @@ async function apiJson(url, opts){
 async function login(){
   const u = document.getElementById('u').value.trim();
   const p = document.getElementById('p').value;
+
   AUTH = 'Basic ' + b64(u + ':' + p);
   sessionStorage.setItem('AUTH', AUTH);
 
   try{
     await apiJson('/api/transfers/ping');
     hideLogin();
-    await loadMyAccountBox();
-    await refreshAll();
+    await initAfterLogin();
   }catch{
     showLogin('Usuario o clave inválidos');
   }
 }
-
-const arMoney = new Intl.NumberFormat('es-AR', { style:'currency', currency:'ARS' });
 
 function pillClass(status) {
   if (!status) return 'bad';
   const s = status.toLowerCase();
   return (s === 'approved' || s === 'accredited') ? 'ok' : 'bad';
 }
-
 function toArDate(iso) {
   try {
     const d = new Date(iso);
     const pad = (n)=> String(n).padStart(2,'0');
     return pad(d.getDate()) + '/' + pad(d.getMonth()+1) + ' ' +
            pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-  } catch {
-    return iso;
-  }
+  } catch { return iso; }
 }
 
 // ===== Cuenta asignada (Alias/CVU) =====
 async function loadMyAccountBox() {
   try {
     const j = await apiJson('/api/transfers/me/account');
-
-    const n = document.getElementById('accNombre');
-    const a = document.getElementById('accAlias');
-    const c = document.getElementById('accCvu');
-
-    if (n) n.textContent = j.nombre || '—';
-    if (a) a.textContent = j.alias || '—';
-    if (c) c.textContent = j.cvu || '—';
+    document.getElementById('accNombre').textContent = j.nombre || '—';
+    document.getElementById('accAlias').textContent = j.alias || '—';
+    document.getElementById('accCvu').textContent = j.cvu || '—';
   } catch {
-    const n = document.getElementById('accNombre');
-    const a = document.getElementById('accAlias');
-    const c = document.getElementById('accCvu');
-    if (n) n.textContent = 'Sin cuenta asignada';
-    if (a) a.textContent = '—';
-    if (c) c.textContent = '—';
+    document.getElementById('accNombre').textContent = 'Sin cuenta asignada';
+    document.getElementById('accAlias').textContent = '—';
+    document.getElementById('accCvu').textContent = '—';
   }
 }
 
@@ -649,7 +697,6 @@ async function loadAcceptedToday() {
 async function ackTransfer(id, btn) {
   try {
     btn.disabled = true;
-
     const r = await apiFetch(`/api/transfers/${id}/ack`, { method: 'POST' });
 
     if (r.status === 409) {
@@ -671,8 +718,69 @@ async function ackTransfer(id, btn) {
   }
 }
 
-// ===== ADMIN =====
-// (mantenemos tus funciones; si tu HTML real incluye admin section, acá podés seguir usando apiJson en vez de fetch+credentials)
+// ===== ADMIN (lógica igual, solo usando apiJson con Authorization) =====
+async function loadAdminSucursales() {
+  const sel = document.getElementById('adminSucursal');
+  if (!sel) return;
+
+  try {
+    const j = await apiJson('/api/transfers/admin/sucursales');
+    const options = (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
+    sel.innerHTML = `<option value=''>Todas</option>` + options;
+  } catch {}
+}
+
+async function loadAdminAcceptedByDay() {
+  const input = document.getElementById('adminDate');
+  const sel = document.getElementById('adminSucursal');
+  const body = document.getElementById('adminAcceptedBody');
+  const total = document.getElementById('adminTotal');
+  const cant = document.getElementById('adminCant');
+  const hint = document.getElementById('adminHint');
+
+  if (!input || !body) return;
+
+  const date = input.value;
+  const suc = sel ? sel.value : "";
+
+  if (!date) {
+    if (hint) hint.textContent = 'Elegí una fecha.';
+    return;
+  }
+  if (hint) hint.textContent = '';
+
+  try {
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>`;
+
+    let url = `/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`;
+    if (suc) url += `&sucursal=${encodeURIComponent(suc)}`;
+
+    const j = await apiJson(url);
+
+    total.textContent = arMoney.format(j.total || 0);
+    cant.textContent = (j.count || 0);
+
+    if (!j.items || j.items.length === 0) {
+      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese filtro.</div></td></tr>`;
+      return;
+    }
+
+    body.innerHTML = j.items.map(x => `
+      <tr>
+        <td class='mono'>${toArDate(x.fecha_utc)}</td>
+        <td class='money'>${arMoney.format(x.monto)}</td>
+        <td>${x.payment_type}</td>
+        <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
+        <td class='mono'>${x.accepted_by || ''}</td>
+        <td class='muted mono'>${x.payment_id}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
+    total.textContent = '$0';
+    cant.textContent = '0';
+  }
+}
 
 function setAdminDefaultDateToday() {
   const input = document.getElementById('adminDate');
@@ -684,20 +792,93 @@ function setAdminDefaultDateToday() {
   input.value = `${yyyy}-${mm}-${dd}`;
 }
 
+async function loadAssignSucursales() {
+  const sel = document.getElementById('assignSucursal');
+  if (!sel) return;
+
+  try {
+    const j = await apiJson('/api/transfers/admin/sucursales');
+    sel.innerHTML = `<option value=''>Elegí sucursal…</option>` +
+      (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
+  } catch {}
+}
+
+async function loadMpAccounts() {
+  const sel = document.getElementById('assignMpAccount');
+  if (!sel) return;
+
+  try {
+    const j = await apiJson('/api/transfers/admin/mp-accounts');
+    const items = j.items || [];
+    const opt = items.map(x => {
+      const label = `${x.id} · ${x.nombre}${x.activa ? '' : ' (inactiva)'}`;
+      return `<option value="${x.id}">${label}</option>`;
+    }).join('');
+    sel.innerHTML = `<option value=''>Elegí cuenta…</option>` + opt;
+  } catch {}
+}
+
+async function assignMpAccountToSucursal() {
+  const suc = document.getElementById('assignSucursal')?.value || '';
+  const acc = document.getElementById('assignMpAccount')?.value || '';
+  const badge = document.getElementById('assignStatus');
+
+  if (!suc || !acc) {
+    if (badge) badge.textContent = 'Elegí sucursal y cuenta';
+    return;
+  }
+
+  try {
+    if (badge) badge.textContent = 'Asignando...';
+
+    const j = await apiJson('/api/transfers/admin/assign-mp-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: suc, mpAccountId: Number(acc) })
+    });
+
+    if (badge) badge.textContent = `OK · ${suc} → cuenta ${acc}`;
+    await loadMyAccountBox();
+    await refreshAll();
+  } catch (e) {
+    if (badge) badge.textContent = `Error: ${e.message}`;
+  }
+}
+
 async function refreshAll() {
   await loadPending();
   await loadAcceptedToday();
 }
 
-// init
+async function initAdminIfPossible(){
+  // Si NO sos admin, esta llamada va a fallar (401/403) y ocultamos el panel
+  try{
+    await apiJson('/api/transfers/admin/sucursales');
+    document.getElementById('adminSection').style.display = 'block';
+    setAdminDefaultDateToday();
+    await loadAdminSucursales();
+    await loadAssignSucursales();
+    await loadMpAccounts();
+    await loadAdminAcceptedByDay();
+  }catch{
+    document.getElementById('adminSection').style.display = 'none';
+  }
+}
+
+async function initAfterLogin(){
+  await loadMyAccountBox();
+  await refreshAll();
+  await initAdminIfPossible();
+  setInterval(refreshAll, 8000);
+}
+
+// init general
 (async function init(){
   if (AUTH){
     try{
       await apiJson('/api/transfers/ping');
       hideLogin();
-      await loadMyAccountBox();
-      await refreshAll();
-      setInterval(refreshAll, 8000);
+      await initAfterLogin();
       return;
     }catch{}
   }
@@ -709,9 +890,9 @@ async function refreshAll() {
 </html>
 """;
 
-    html = html.Replace("__ADMIN_HTML__", adminHtml);
-    html = html.Replace("__ACCOUNT_BOX__", accountBoxHtml);
-    html = html.Replace("__CUENTA__", cuenta);
+    html = html.Replace("{{adminHtml}}", adminHtml);
+    html = html.Replace("{{accountBoxHtml}}", accountBoxHtml);
+    html = html.Replace("{{cuenta}}", cuenta);
 
     return Results.Content(html, "text/html; charset=utf-8");
 });
