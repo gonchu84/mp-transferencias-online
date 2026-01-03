@@ -141,7 +141,9 @@ app.Use(async (ctx, next) =>
         return;
     }
 
-    if (!TryGetBasicCredentials(ctx.Request.Headers["Authorization"], out var u, out var p))
+    var authHeader = ctx.Request.Headers.Authorization.ToString();
+
+    if (!TryGetBasicCredentials(authHeader, out var u, out var p))
     {
         await Json401(ctx, "Falta Authorization");
         return;
