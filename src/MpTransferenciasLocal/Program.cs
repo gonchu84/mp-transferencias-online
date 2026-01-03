@@ -121,11 +121,45 @@ static string NormalizeConnString(IConfiguration cfg)
     return cs;
 }
 
+// ✅ Valida usuario/clave contra DB usando BCrypt
+static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
+    IConfiguration cfg,
+    string username,
+    string password)
+{
+    var cs = NormalizeConnString(cfg);
+
+    await using var conn = new NpgsqlConnection(cs);
+    await conn.OpenAsync();
+
+    var sql = """
+        select role, password_hash
+        from app_users
+        where username = @u
+        limit 1;
+    """;
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("u", username);
+
+    await using var rd = await cmd.ExecuteReaderAsync();
+    if (!await rd.ReadAsync())
+        return (false, null);
+
+    var role = rd.IsDBNull(0) ? null : rd.GetString(0);
+    var hash = rd.IsDBNull(1) ? "" : rd.GetString(1);
+
+    if (string.IsNullOrWhiteSpace(hash))
+        return (false, role);
+
+    // BCrypt.Net-Next
+    var ok = BCrypt.Net.BCrypt.Verify(password, hash);
+    return (ok, role);
+}
+
 var app = builder.Build();
 
 // ================= DB INIT =================
-// OJO: si DbBootstrap/DbSeed internamente usan GetConnectionString("Db"),
-// es mejor que ellos también normalicen. Acá al menos aseguramos que DbSeed reciba algo válido.
 await DbBootstrap.EnsureCreatedAsync(app.Configuration);
 
 try
@@ -138,42 +172,55 @@ catch (Exception ex)
     Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
 }
 
-// ================= AUTH (Basic) =================
-var authUsers = AuthHelpers.LoadAuthUsers(app.Configuration);
-
-if (authUsers.Count > 0)
+// ================= AUTH (Basic) - AHORA POR DB =================
+app.Use(async (ctx, next) =>
 {
-    app.Use(async (ctx, next) =>
+    // permitir health sin auth
+    if (ctx.Request.Path.StartsWithSegments("/health"))
     {
-        if (ctx.Request.Path.StartsWithSegments("/health"))
-        {
-            await next();
-            return;
-        }
+        await next();
+        return;
+    }
 
-        var authHeader = ctx.Request.Headers["Authorization"].ToString();
+    var authHeader = ctx.Request.Headers["Authorization"].ToString();
 
-        if (TryGetBasicCredentials(authHeader, out var user, out var pass))
-        {
-            if (authUsers.TryGetValue(user, out var u) && u.Pass == pass)
-            {
-                var claims = new List<Claim>
-                {
-                    new(ClaimTypes.Name, u.User),
-                    new(ClaimTypes.Role, string.IsNullOrWhiteSpace(u.Role) ? "Sucursal" : u.Role!)
-                };
-
-                ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
-                await next();
-                return;
-            }
-        }
-
+    if (!TryGetBasicCredentials(authHeader, out var user, out var pass))
+    {
         ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
         ctx.Response.StatusCode = 401;
         await ctx.Response.WriteAsync("Unauthorized");
-    });
-}
+        return;
+    }
+
+    try
+    {
+        var (ok, role) = await ValidateUserFromDbAsync(app.Configuration, user, pass);
+
+        if (!ok)
+        {
+            ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
+            ctx.Response.StatusCode = 401;
+            await ctx.Response.WriteAsync("Unauthorized");
+            return;
+        }
+
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.Name, user),
+            new(ClaimTypes.Role, string.IsNullOrWhiteSpace(role) ? "sucursal" : role!)
+        };
+
+        ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
+        await next();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("⚠ Auth DB error: " + ex.Message);
+        ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
+        ctx.Response.StatusCode = 401;
+        await ctx.Response.WriteAsync("Unauthorized");
+    }
+});
 
 app.UseAuthorization();
 
@@ -186,8 +233,7 @@ Console.WriteLine("Cuenta: " + (builder.Configuration["Cuenta"] ?? "(null)"));
 Console.WriteLine("Alias: " + (builder.Configuration["Alias"] ?? "(null)"));
 Console.WriteLine("CVU: " + (builder.Configuration["CVU"] ?? "(null)"));
 Console.WriteLine("Token OK?: " + (!string.IsNullOrWhiteSpace(builder.Configuration["MercadoPago:AccessToken"])));
-Console.WriteLine("Auth Users: " + authUsers.Count);
-Console.WriteLine("Auth Usernames: " + (authUsers.Count == 0 ? "(none)" : string.Join(", ", authUsers.Keys)));
+Console.WriteLine("Auth: DB (app_users + BCrypt)");
 Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
@@ -210,8 +256,8 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
           + "</div>"
         : "";
 
-    // Nota: NO usamos meta refresh. Actualizamos con JS cada 8s.
-    var html = $@"
+    // ✅ IMPORTANTE: usamos $$""" ... """ para que NO se rompa con { } del JS
+    var html = $$"""
 <!doctype html>
 <html lang='es'>
 <head>
@@ -219,111 +265,101 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>MP Transferencias</title>
 <style>
-:root{{
+:root{
   --bg:#0b1220; --card:#0f172a; --border:#1f2937;
   --muted:#94a3b8; --text:#e5e7eb; --accent:#22c55e; --danger:#ef4444;
-}}
-*{{box-sizing:border-box}}
-body{{
+}
+*{box-sizing:border-box}
+body{
   margin:0;
   font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
   background:radial-gradient(1200px 600px at 20% -10%, rgba(34,197,94,.15), transparent),
              radial-gradient(900px 500px at 100% 0%, rgba(59,130,246,.12), transparent),
              var(--bg);
   color:var(--text);
-}}
-.container{{max-width:1200px;margin:18px auto;padding:0 14px 80px}}
-.card{{
+}
+.container{max-width:1200px;margin:18px auto;padding:0 14px 80px}
+.card{
   background:linear-gradient(180deg, rgba(255,255,255,.03), transparent), var(--card);
   border:1px solid var(--border); border-radius:18px;
   box-shadow:0 10px 30px rgba(0,0,0,.25); overflow:hidden;
-}}
-.header{{
+}
+.header{
   padding:18px 18px 14px;
   background:linear-gradient(90deg, rgba(34,197,94,.16), transparent 60%);
   border-bottom:1px solid var(--border);
-}}
-.titleRow{{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}}
-h1{{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}}
-.sub{{margin-top:6px;color:rgba(226,232,240,.9);font-size:14px;font-weight:600}}
-.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}}
-
-.accountBox{{
-  margin-top:14px;
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:12px;
-  padding:14px;
-  background:rgba(255,255,255,.03);
-  border:1px solid rgba(148,163,184,.18);
-  border-radius:14px;
-}}
-.kv{{
+}
+.titleRow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+h1{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}
+.sub{margin-top:6px;color:rgba(226,232,240,.9);font-size:14px;font-weight:600}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+.accountBox{
+  margin-top:14px; display:grid; grid-template-columns:1fr 1fr; gap:12px;
+  padding:14px; background:rgba(255,255,255,.03);
+  border:1px solid rgba(148,163,184,.18); border-radius:14px;
+}
+.kv{
   display:flex;flex-direction:column;gap:6px;
   padding:12px 14px;border-radius:12px;
   background:linear-gradient(180deg, rgba(34,197,94,.12), rgba(255,255,255,.02));
   border:1px solid rgba(34,197,94,.22);
-}}
-.k{{color:rgba(226,232,240,.85);font-size:12px;letter-spacing:.8px;text-transform:uppercase;font-weight:800}}
-.v{{font-weight:900;font-size:18px;word-break:break-all}}
-
-.sectionTitle{{
+}
+.k{color:rgba(226,232,240,.85);font-size:12px;letter-spacing:.8px;text-transform:uppercase;font-weight:800}
+.v{font-weight:900;font-size:18px;word-break:break-all}
+.sectionTitle{
   display:flex;justify-content:space-between;align-items:center;
   padding:14px 18px;border-top:1px solid var(--border);
   background:rgba(255,255,255,.02);
-}}
-.sectionTitle h2{{margin:0;font-size:16px;font-weight:900;letter-spacing:.2px}}
-.badge{{
+}
+.sectionTitle h2{margin:0;font-size:16px;font-weight:900;letter-spacing:.2px}
+.badge{
   display:inline-flex;align-items:center;gap:8px;
   padding:6px 10px;border-radius:999px;
   border:1px solid rgba(255,255,255,.08);
   color:#cbd5e1;background:rgba(255,255,255,.03);
   font-size:12px;font-weight:800;
-}}
-.badge b{{color:#fff}}
-
-.tableWrap{{overflow:auto}}
-table{{width:100%;border-collapse:collapse;min-width:860px}}
-thead th{{position:sticky;top:0;z-index:1;background:rgba(15,23,42,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}}
-th,td{{padding:12px 14px;border-bottom:1px solid rgba(31,41,55,.85);font-size:14.5px;white-space:nowrap}}
-tbody tr:nth-child(odd){{background:rgba(255,255,255,.015)}}
-th{{text-align:left;color:#cbd5e1;font-weight:700}}
-.money{{font-weight:900}}
-.pill{{display:inline-flex;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:800;border:1px solid rgba(255,255,255,.08)}}
-.ok{{background:rgba(34,197,94,.18);color:#bbf7d0}}
-.bad{{background:rgba(239,68,68,.18);color:#fecaca}}
-.muted{{color:var(--muted)}}
-
-.btn{{
-  cursor:pointer;
-  padding:8px 12px;border-radius:12px;
+}
+.badge b{color:#fff}
+.tableWrap{overflow:auto}
+table{width:100%;border-collapse:collapse;min-width:860px}
+thead th{position:sticky;top:0;z-index:1;background:rgba(15,23,42,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
+th,td{padding:12px 14px;border-bottom:1px solid rgba(31,41,55,.85);font-size:14.5px;white-space:nowrap}
+tbody tr:nth-child(odd){background:rgba(255,255,255,.015)}
+th{text-align:left;color:#cbd5e1;font-weight:700}
+.money{font-weight:900}
+.pill{display:inline-flex;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:800;border:1px solid rgba(255,255,255,.08)}
+.ok{background:rgba(34,197,94,.18);color:#bbf7d0}
+.bad{background:rgba(239,68,68,.18);color:#fecaca}
+.muted{color:var(--muted)}
+.btn{
+  cursor:pointer; padding:8px 12px; border-radius:12px;
   border:1px solid rgba(34,197,94,.35);
   background:rgba(34,197,94,.12);
   color:#bbf7d0;font-weight:900;
-}}
-.btn:disabled{{opacity:.5;cursor:not-allowed}}
-.btnDanger{{
+}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btnDanger{
   border:1px solid rgba(239,68,68,.35);
   background:rgba(239,68,68,.10);
   color:#fecaca;
-}}
-.errorBox{{
+}
+.errorBox{
   padding:12px 14px;border-radius:12px;
   border:1px solid rgba(239,68,68,.35);
   background:rgba(239,68,68,.08);color:#fecaca;font-size:14px;
-}}
-.footer{{
+}
+.footer{
   position:fixed;bottom:0;left:0;right:0;padding:12px 14px;text-align:center;
   color:rgba(148,163,184,.85);font-size:12px;
   background:rgba(11,18,32,.75);backdrop-filter:blur(8px);
   border-top:1px solid rgba(31,41,55,.7)
-}}
-.brand{{color:#e5e7eb;font-weight:800}}
-@media (max-width: 700px){{
-  h1{{font-size:24px}}
-  .accountBox{{grid-template-columns:1fr}}
-  .v{{font-size:16px}}
-}}
+}
+.brand{color:#e5e7eb;font-weight:800}
+@media (max-width: 700px){
+  h1{font-size:24px}
+  .accountBox{grid-template-columns:1fr}
+  .v{font-size:16px}
+}
 </style>
 </head>
 <body>
@@ -331,10 +367,10 @@ th{{text-align:left;color:#cbd5e1;font-weight:700}}
   <div class='card'>
     <div class='header'>
       <div class='titleRow'>
-        <h1>MP Transferencias · {cuenta}</h1>
+        <h1>MP Transferencias · {{cuenta}}</h1>
         <div class='sub'>Pendientes (últimas <b>20</b>) · Actualiza cada <b>8</b> segundos</div>
       </div>
-      {accountBoxHtml}
+      {{accountBoxHtml}}
     </div>
 
     <div class='sectionTitle'>
@@ -388,63 +424,59 @@ th{{text-align:left;color:#cbd5e1;font-weight:700}}
 <div class='footer'>By <span class='brand'>PS3 Larroque</span></div>
 
 <script>
-const arMoney = new Intl.NumberFormat('es-AR', {{ style:'currency', currency:'ARS' }});
+const arMoney = new Intl.NumberFormat('es-AR', { style:'currency', currency:'ARS' });
 
-function pillClass(status) {{
+function pillClass(status) {
   if (!status) return 'bad';
   const s = status.toLowerCase();
   return (s === 'approved' || s === 'accredited') ? 'ok' : 'bad';
-}}
+}
 
-function toArDate(iso) {{
-  try {{
-    // iso viene con offset/utc -> mostramos AR
+function toArDate(iso) {
+  try {
     const d = new Date(iso);
-    // formato dd/MM HH:mm:ss
     const pad = (n)=> String(n).padStart(2,'0');
     return pad(d.getDate()) + '/' + pad(d.getMonth()+1) + ' ' +
            pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-  }} catch {{
+  } catch {
     return iso;
-  }}
-}}
+  }
+}
 
-async function loadPending() {{
+async function loadPending() {
   const body = document.getElementById('pendingBody');
-  try {{
+  try {
     const r = await fetch('/api/transfers/pending?limit=20');
     const j = await r.json();
 
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error pending');
 
-    if (!j.items || j.items.length === 0) {{
+    if (!j.items || j.items.length === 0) {
       body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay transferencias pendientes.</div></td></tr>`;
       return;
-    }}
+    }
 
     body.innerHTML = j.items.map(x => `
-      <tr data-id='${{x.id}}'>
-        <td>
-          <button class='btn' onclick='ackTransfer(${{x.id}}, this)'>Aceptar</button>
-        </td>
-        <td class='mono'>${{toArDate(x.fecha_utc)}}</td>
-        <td class='money'>${{arMoney.format(x.monto)}}</td>
-        <td>${{x.payment_type}}</td>
-        <td><span class='pill ${{pillClass(x.status)}}'>${{x.status}}</span></td>
-        <td class='muted mono'>${{x.payment_id}}</td>
+      <tr data-id='${x.id}'>
+        <td><button class='btn' onclick='ackTransfer(${x.id}, this)'>Aceptar</button></td>
+        <td class='mono'>${toArDate(x.fecha_utc)}</td>
+        <td class='money'>${arMoney.format(x.monto)}</td>
+        <td>${x.payment_type}</td>
+        <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
+        <td class='muted mono'>${x.payment_id}</td>
       </tr>
     `).join('');
-  }} catch (e) {{
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando pendientes: ${{e.message}}</div></td></tr>`;
-  }}
-}}
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando pendientes: ${e.message}</div></td></tr>`;
+  }
+}
 
-async function loadAcceptedToday() {{
+async function loadAcceptedToday() {
   const body = document.getElementById('acceptedBody');
   const total = document.getElementById('totalHoy');
   const cant = document.getElementById('cantHoy');
 
-  try {{
+  try {
     const r = await fetch('/api/transfers/accepted/today');
     const j = await r.json();
 
@@ -453,59 +485,55 @@ async function loadAcceptedToday() {{
     total.textContent = arMoney.format(j.total || 0);
     cant.textContent = (j.count || 0);
 
-    if (!j.items || j.items.length === 0) {{
+    if (!j.items || j.items.length === 0) {
       body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Todavía no aceptaste transferencias hoy.</div></td></tr>`;
       return;
-    }}
+    }
 
     body.innerHTML = j.items.map(x => `
       <tr>
-        <td class='mono'>${{toArDate(x.fecha_utc)}}</td>
-        <td class='money'>${{arMoney.format(x.monto)}}</td>
-        <td>${{x.payment_type}}</td>
-        <td><span class='pill ${{pillClass(x.status)}}'>${{x.status}}</span></td>
-        <td class='muted mono'>${{x.payment_id}}</td>
+        <td class='mono'>${toArDate(x.fecha_utc)}</td>
+        <td class='money'>${arMoney.format(x.monto)}</td>
+        <td>${x.payment_type}</td>
+        <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
+        <td class='muted mono'>${x.payment_id}</td>
       </tr>
     `).join('');
-  }} catch (e) {{
-    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Error cargando aceptadas: ${{e.message}}</div></td></tr>`;
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Error cargando aceptadas: ${e.message}</div></td></tr>`;
     total.textContent = '$0';
     cant.textContent = '0';
-  }}
-}}
+  }
+}
 
-async function ackTransfer(id, btn) {{
-  try {{
+async function ackTransfer(id, btn) {
+  try {
     btn.disabled = true;
-    const r = await fetch(`/api/transfers/${{id}}/ack`, {{
-      method: 'POST'
-    }});
+    const r = await fetch(`/api/transfers/${id}/ack`, { method: 'POST' });
 
-    if (r.status === 409) {{
+    if (r.status === 409) {
       btn.classList.add('btnDanger');
       btn.textContent = 'Ya tomada';
-      // refrescamos igual
       await refreshAll();
       return;
-    }}
+    }
 
-    if (!r.ok) {{
+    if (!r.ok) {
       const t = await r.text();
       throw new Error(t || 'Error aceptando');
-    }}
+    }
 
-    // OK: refrescamos ambos paneles
     await refreshAll();
-  }} catch (e) {{
+  } catch (e) {
     btn.disabled = false;
     alert('Error al aceptar: ' + e.message);
-  }}
-}}
+  }
+}
 
-async function refreshAll() {{
+async function refreshAll() {
   await loadPending();
   await loadAcceptedToday();
-}}
+}
 
 refreshAll();
 setInterval(refreshAll, 8000);
@@ -513,7 +541,8 @@ setInterval(refreshAll, 8000);
 
 </body>
 </html>
-";
+""";
+
     return Results.Content(html, "text/html; charset=utf-8");
 });
 
