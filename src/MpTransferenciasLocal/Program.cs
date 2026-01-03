@@ -154,6 +154,14 @@ static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
     return (ok, role);
 }
 
+// ✅ 401 JSON (sin WWW-Authenticate => NO popup navegador)
+static async Task Json401(HttpContext ctx, string msg)
+{
+    ctx.Response.StatusCode = 401;
+    ctx.Response.ContentType = "application/json; charset=utf-8";
+    await ctx.Response.WriteAsync($$"""{"ok":false,"message":"{{msg}}"}""");
+}
+
 var app = builder.Build();
 
 // ================= DB INIT =================
@@ -181,14 +189,13 @@ app.Use(async (ctx, next) =>
     Console.WriteLine($"RESP {ctx.Response.StatusCode} {ctx.Request.Method} {ctx.Request.Path}");
 });
 
-// ✅ Basic Auth para "/" y "/api/*"
+// ✅ AUTH SOLO PARA /api/* (y sin WWW-Authenticate para que NO haya popup)
 app.Use(async (ctx, next) =>
 {
     var path = ctx.Request.Path.Value ?? "";
 
-    var needsAuth =
-        path == "/" ||
-        path.StartsWith("/api", StringComparison.OrdinalIgnoreCase);
+    // ✅ Home y assets públicos => evita popup
+    var needsAuth = path.StartsWith("/api", StringComparison.OrdinalIgnoreCase);
 
     if (!needsAuth)
     {
@@ -200,10 +207,8 @@ app.Use(async (ctx, next) =>
 
     if (!TryGetBasicCredentials(authHeader, out var user, out var pass))
     {
-        Console.WriteLine($"AUTH CHALLENGE (sin header) -> {ctx.Request.Method} {path}");
-        ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
-        ctx.Response.StatusCode = 401;
-        await ctx.Response.WriteAsync("Unauthorized");
+        Console.WriteLine($"AUTH 401 (sin header) -> {ctx.Request.Method} {path}");
+        await Json401(ctx, "Falta Authorization");
         return;
     }
 
@@ -213,10 +218,8 @@ app.Use(async (ctx, next) =>
 
         if (!ok)
         {
-            Console.WriteLine($"AUTH CHALLENGE (credenciales inválidas) user={user} -> {ctx.Request.Method} {path}");
-            ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
-            ctx.Response.StatusCode = 401;
-            await ctx.Response.WriteAsync("Unauthorized");
+            Console.WriteLine($"AUTH 401 (credenciales inválidas) user={user} -> {ctx.Request.Method} {path}");
+            await Json401(ctx, "Credenciales inválidas");
             return;
         }
 
@@ -234,9 +237,7 @@ app.Use(async (ctx, next) =>
     catch (Exception ex)
     {
         Console.WriteLine("⚠ Auth DB error: " + ex.Message);
-        ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"MP Transferencias\"";
-        ctx.Response.StatusCode = 401;
-        await ctx.Response.WriteAsync("Unauthorized");
+        await Json401(ctx, "Error autenticando");
     }
 });
 
