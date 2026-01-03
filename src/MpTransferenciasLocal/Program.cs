@@ -1,9 +1,7 @@
 using System.Security.Claims;
 using System.Text;
-using System.Text.Encodings.Web;
-using Microsoft.AspNetCore.Authentication;
-using Microsoft.Extensions.Options;
 using Npgsql;
+using Microsoft.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,24 +14,17 @@ builder.Configuration.AddEnvironmentVariables();
 
 // ================= SERVICES =================
 builder.Services.AddControllers();
-
-builder.Services
-    .AddAuthentication("Basic")
-    .AddScheme<AuthenticationSchemeOptions, DummyAuthHandler>("Basic", _ => { });
-
 builder.Services.AddAuthorization();
 
+// 🔹 HttpClient para MpPollingService
 builder.Services.AddHttpClient();
 
-builder.Services.AddHostedService<MpPollingService>();
-
-
-// 🔑 AUTENTICACIÓN (CLAVE PARA QUE FUNCIONE [Authorize])
-builder.Services
-    .AddAuthentication("Basic")
-    .AddScheme<AuthenticationSchemeOptions, DummyAuthHandler>("Basic", _ => { });
-
-builder.Services.AddAuthorization();
+// 🔹 IMPORTANTE: si el polling falla, NO tirar abajo la app
+builder.Services.Configure<HostOptions>(opts =>
+{
+    opts.BackgroundServiceExceptionBehavior =
+        BackgroundServiceExceptionBehavior.Ignore;
+});
 
 builder.Services.AddHostedService<MpPollingService>();
 
@@ -42,7 +33,7 @@ static bool TryGetBasicCredentials(string authHeader, out string user, out strin
 {
     user = ""; pass = "";
     if (string.IsNullOrWhiteSpace(authHeader)) return false;
-    if (!authHeader.StartsWith("Basic ")) return false;
+    if (!authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase)) return false;
 
     try
     {
@@ -66,7 +57,8 @@ static string NormalizeConnString(IConfiguration cfg)
 
     cs = cs.Trim().Trim('"');
 
-    if (cs.StartsWith("postgres://") || cs.StartsWith("postgresql://"))
+    if (cs.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+        cs.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
     {
         var uri = new Uri(cs);
         var userInfo = uri.UserInfo.Split(':', 2);
@@ -138,10 +130,9 @@ static async Task Json401(HttpContext ctx, string msg)
 var app = builder.Build();
 
 app.UseRouting();
-app.UseAuthentication();
 app.UseAuthorization();
 
-// ================= AUTH MIDDLEWARE =================
+// ================= AUTH MANUAL (ÚNICO SISTEMA) =================
 app.Use(async (ctx, next) =>
 {
     if (!ctx.Request.Path.StartsWithSegments("/api"))
@@ -168,7 +159,7 @@ app.Use(async (ctx, next) =>
         {
             new Claim(ClaimTypes.Name, u),
             new Claim(ClaimTypes.Role, role ?? "sucursal")
-        }, "Basic")
+        }, "Manual")
     );
 
     await next();
@@ -275,28 +266,3 @@ if(AUTH){
 });
 
 app.Run();
-
-// ================= AUTH HANDLER =================
-#pragma warning disable CS0618
-public class DummyAuthHandler : AuthenticationHandler<AuthenticationSchemeOptions>
-{
-    public DummyAuthHandler(
-        IOptionsMonitor<AuthenticationSchemeOptions> options,
-        ILoggerFactory logger,
-        UrlEncoder encoder,
-        ISystemClock clock
-    ) : base(options, logger, encoder, clock) { }
-
-    protected override Task<AuthenticateResult> HandleAuthenticateAsync()
-    {
-        if (Context.User?.Identity?.IsAuthenticated == true)
-        {
-            return Task.FromResult(
-                AuthenticateResult.Success(
-                    new AuthenticationTicket(Context.User, "Basic")));
-        }
-
-        return Task.FromResult(AuthenticateResult.NoResult());
-    }
-}
-
