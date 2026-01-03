@@ -242,11 +242,14 @@ app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.No
 app.MapControllers();
 
 // ✅ HOME (Pendientes + Aceptadas hoy)
+// ✅ HOME (Pendientes + Aceptadas hoy + (ADMIN) Aceptadas por día)
 app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
     var alias = cfg["Alias"] ?? "";
     var cvu = cfg["CVU"] ?? "";
+
+    var isAdmin = ctx.User?.IsInRole("admin") == true;
 
     var showAccountBox = !(string.IsNullOrWhiteSpace(alias) && string.IsNullOrWhiteSpace(cvu));
     var accountBoxHtml = showAccountBox
@@ -255,6 +258,39 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
           + (string.IsNullOrWhiteSpace(cvu) ? "" : ("<div class='kv'><div class='k'>CVU</div><div class='v mono'>" + cvu + "</div></div>"))
           + "</div>"
         : "";
+
+    // Bloque ADMIN (HTML) - aparece solo si role=admin
+    var adminHtml = isAdmin ? """
+    <div class='sectionTitle adminTitle'>
+      <h2>ADMIN · Aceptadas por día (todas)</h2>
+      <div class='badge'>Total: <b id='adminTotal'>$0</b> · Cant: <b id='adminCant'>0</b></div>
+    </div>
+
+    <div class='adminBar'>
+      <label class='adminLbl'>Día</label>
+      <input id='adminDate' type='date' class='adminInput' />
+      <button class='btn' onclick='loadAdminAcceptedByDay()'>Buscar</button>
+      <span class='muted' id='adminHint'></span>
+    </div>
+
+    <div class='tableWrap'>
+      <table>
+        <thead>
+          <tr>
+            <th>Hora (AR)</th>
+            <th>Monto</th>
+            <th>Medio</th>
+            <th>Estado</th>
+            <th>Aceptada por</th>
+            <th class='muted'>Payment ID</th>
+          </tr>
+        </thead>
+        <tbody id='adminAcceptedBody'>
+          <tr><td colspan='6'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
+        </tbody>
+      </table>
+    </div>
+    """ : "";
 
     // ✅ IMPORTANTE: usamos $$""" ... """ para que NO se rompa con { } del JS
     var html = $$"""
@@ -355,10 +391,32 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
   border-top:1px solid rgba(31,41,55,.7)
 }
 .brand{color:#e5e7eb;font-weight:800}
+
+/* ADMIN */
+.adminTitle{
+  background:linear-gradient(90deg, rgba(59,130,246,.18), transparent 60%);
+}
+.adminBar{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:12px 18px;
+  border-top:1px solid var(--border);
+  background:rgba(255,255,255,.015);
+}
+.adminLbl{font-weight:800;color:#cbd5e1;font-size:13px}
+.adminInput{
+  background:rgba(255,255,255,.03);
+  border:1px solid rgba(148,163,184,.25);
+  color:#e5e7eb;
+  padding:8px 10px;
+  border-radius:12px;
+  font-weight:800;
+}
+
 @media (max-width: 700px){
   h1{font-size:24px}
   .accountBox{grid-template-columns:1fr}
   .v{font-size:16px}
+  table{min-width:740px}
 }
 </style>
 </head>
@@ -417,6 +475,8 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
         </tbody>
       </table>
     </div>
+
+    {{adminHtml}}
 
   </div>
 </div>
@@ -530,6 +590,66 @@ async function ackTransfer(id, btn) {
   }
 }
 
+// ===== ADMIN =====
+async function loadAdminAcceptedByDay() {
+  const input = document.getElementById('adminDate');
+  const body = document.getElementById('adminAcceptedBody');
+  const total = document.getElementById('adminTotal');
+  const cant = document.getElementById('adminCant');
+  const hint = document.getElementById('adminHint');
+
+  if (!input || !body) return; // no es admin (no existe el bloque)
+
+  const date = input.value;
+  if (!date) {
+    hint.textContent = 'Elegí una fecha.';
+    return;
+  }
+  hint.textContent = '';
+
+  try {
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>`;
+    const r = await fetch(`/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`);
+    const j = await r.json();
+
+    if (!r.ok || !j.ok) throw new Error(j?.message || 'Error admin accepted/by-day');
+
+    total.textContent = arMoney.format(j.total || 0);
+    cant.textContent = (j.count || 0);
+
+    if (!j.items || j.items.length === 0) {
+      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese día.</div></td></tr>`;
+      return;
+    }
+
+    body.innerHTML = j.items.map(x => `
+      <tr>
+        <td class='mono'>${toArDate(x.fecha_utc)}</td>
+        <td class='money'>${arMoney.format(x.monto)}</td>
+        <td>${x.payment_type}</td>
+        <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
+        <td class='mono'>${x.accepted_by || ''}</td>
+        <td class='muted mono'>${x.payment_id}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
+    total.textContent = '$0';
+    cant.textContent = '0';
+  }
+}
+
+function setAdminDefaultDateToday() {
+  const input = document.getElementById('adminDate');
+  if (!input) return;
+  // Fecha local del navegador (AR si estás en AR)
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth()+1).padStart(2,'0');
+  const dd = String(now.getDate()).padStart(2,'0');
+  input.value = `${yyyy}-${mm}-${dd}`;
+}
+
 async function refreshAll() {
   await loadPending();
   await loadAcceptedToday();
@@ -537,13 +657,21 @@ async function refreshAll() {
 
 refreshAll();
 setInterval(refreshAll, 8000);
+
+// si es admin, seteamos hoy por defecto y traemos el día automáticamente
+setAdminDefaultDateToday();
+loadAdminAcceptedByDay();
 </script>
 
 </body>
 </html>
 """;
 
+    // inyectamos el bloque admin solo si corresponde
+    html = html.Replace("{{adminHtml}}", adminHtml);
+
     return Results.Content(html, "text/html; charset=utf-8");
 });
+
 
 app.Run();

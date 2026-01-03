@@ -432,4 +432,82 @@ public class TransfersController : ControllerBase
 
         return builder.ConnectionString;
     }
+
+    // ✅ ADMIN: Aceptadas por día (todas las sucursales / usuarios)
+// GET /api/transfers/admin/accepted/by-day?date=2026-01-03
+[HttpGet("admin/accepted/by-day")]
+[Authorize(Roles = "admin")]
+public async Task<IActionResult> AdminAcceptedByDay([FromQuery] string date)
+{
+    if (!DateTime.TryParseExact(
+        date,
+        "yyyy-MM-dd",
+        CultureInfo.InvariantCulture,
+        DateTimeStyles.None,
+        out var day))
+    {
+        return BadRequest(new
+        {
+            ok = false,
+            message = "Formato inválido. Usá yyyy-MM-dd",
+            date
+        });
+    }
+
+    await using var conn = new NpgsqlConnection(GetConn());
+    await conn.OpenAsync();
+
+    var sql = """
+        select
+            t.id,
+            t.payment_id,
+            t.fecha_utc,
+            t.monto,
+            t.payment_type,
+            t.status,
+            a.username,
+            a.ack_at_utc,
+            a.ack_date_ar
+        from transfer_ack a
+        join transfers t on t.id = a.transfer_id
+        where a.ack_date_ar = @day::date
+        order by a.ack_at_utc desc;
+    """;
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    cmd.Parameters.AddWithValue("day", day);
+
+    var items = new List<object>();
+    decimal total = 0;
+
+    await using var rd = await cmd.ExecuteReaderAsync();
+    while (await rd.ReadAsync())
+    {
+        var monto = rd.GetDecimal(3);
+        total += monto;
+
+        items.Add(new
+        {
+            id = rd.GetInt64(0),
+            payment_id = rd.GetString(1),
+            fecha_utc = rd.GetFieldValue<DateTimeOffset>(2).ToString("o"),
+            monto,
+            payment_type = rd.GetString(4),
+            status = rd.GetString(5),
+            accepted_by = rd.GetString(6),
+            ack_at_utc = rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
+            ack_date_ar = rd.GetFieldValue<DateTime>(8).ToString("yyyy-MM-dd")
+        });
+    }
+
+    return Ok(new
+    {
+        ok = true,
+        date,
+        count = items.Count,
+        total,
+        items
+    });
+}
+
 }
