@@ -433,41 +433,35 @@ public class TransfersController : ControllerBase
         return builder.ConnectionString;
     }
 
-    // ✅ ADMIN: Aceptadas por día (todas las sucursales / usuarios)
-// GET /api/transfers/admin/accepted/by-day?date=2026-01-03
+// ✅ ADMIN: Aceptadas por día + filtro por sucursal(username)
+// GET /api/transfers/admin/accepted/by-day?date=2026-01-03&sucursal=Banfield
 [HttpGet("admin/accepted/by-day")]
 [Authorize(Roles = "admin")]
-public async Task<IActionResult> AdminAcceptedByDay([FromQuery] string date)
+public async Task<IActionResult> AdminAcceptedByDay([FromQuery] string date, [FromQuery] string? sucursal = null)
 {
-    if (!DateTime.TryParseExact(
-        date,
-        "yyyy-MM-dd",
-        CultureInfo.InvariantCulture,
-        DateTimeStyles.None,
-        out var day))
+    if (!DateTime.TryParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day))
     {
-        return BadRequest(new
-        {
-            ok = false,
-            message = "Formato inválido. Usá yyyy-MM-dd",
-            date
-        });
+        return BadRequest(new { ok = false, message = "Formato inválido. Usá yyyy-MM-dd", date });
     }
 
     await using var conn = new NpgsqlConnection(GetConn());
     await conn.OpenAsync();
 
-    var sql = """
+    var hasSucursal = !string.IsNullOrWhiteSpace(sucursal);
+
+    var sql = hasSucursal ? """
         select
-            t.id,
-            t.payment_id,
-            t.fecha_utc,
-            t.monto,
-            t.payment_type,
-            t.status,
-            a.username,
-            a.ack_at_utc,
-            a.ack_date_ar
+            t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
+            a.username, a.ack_at_utc, a.ack_date_ar
+        from transfer_ack a
+        join transfers t on t.id = a.transfer_id
+        where a.ack_date_ar = @day::date
+          and a.username = @sucursal
+        order by a.ack_at_utc desc;
+    """ : """
+        select
+            t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
+            a.username, a.ack_at_utc, a.ack_date_ar
         from transfer_ack a
         join transfers t on t.id = a.transfer_id
         where a.ack_date_ar = @day::date
@@ -476,6 +470,9 @@ public async Task<IActionResult> AdminAcceptedByDay([FromQuery] string date)
 
     await using var cmd = new NpgsqlCommand(sql, conn);
     cmd.Parameters.AddWithValue("day", day);
+
+    if (hasSucursal)
+        cmd.Parameters.AddWithValue("sucursal", sucursal!);
 
     var items = new List<object>();
     decimal total = 0;
@@ -500,14 +497,34 @@ public async Task<IActionResult> AdminAcceptedByDay([FromQuery] string date)
         });
     }
 
-    return Ok(new
-    {
-        ok = true,
-        date,
-        count = items.Count,
-        total,
-        items
-    });
+    return Ok(new { ok = true, date, sucursal = sucursal ?? "", count = items.Count, total, items });
 }
+
+// ✅ ADMIN: lista de sucursales/usuarios (para filtro)
+// GET /api/transfers/admin/sucursales
+[HttpGet("admin/sucursales")]
+[Authorize(Roles = "admin")]
+public async Task<IActionResult> AdminSucursales()
+{
+    await using var conn = new NpgsqlConnection(GetConn());
+    await conn.OpenAsync();
+
+    var sql = """
+        select username
+        from app_users
+        where coalesce(role,'') <> 'admin'
+        order by username;
+    """;
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
+
+    var items = new List<string>();
+    await using var rd = await cmd.ExecuteReaderAsync();
+    while (await rd.ReadAsync())
+        items.Add(rd.GetString(0));
+
+    return Ok(new { ok = true, items });
+}
+
 
 }

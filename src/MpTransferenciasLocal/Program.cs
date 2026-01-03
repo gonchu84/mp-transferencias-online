@@ -241,8 +241,7 @@ app.MapGet("/health", () => Results.Ok(new { ok = true, time = DateTimeOffset.No
 
 app.MapControllers();
 
-// ✅ HOME (Pendientes + Aceptadas hoy)
-// ✅ HOME (Pendientes + Aceptadas hoy + (ADMIN) Aceptadas por día)
+// ✅ HOME (Pendientes + Aceptadas hoy + (ADMIN) Aceptadas por día + filtro sucursal)
 app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
@@ -269,6 +268,12 @@ app.MapGet("/", (HttpContext ctx, IConfiguration cfg) =>
     <div class='adminBar'>
       <label class='adminLbl'>Día</label>
       <input id='adminDate' type='date' class='adminInput' />
+
+      <label class='adminLbl'>Sucursal</label>
+      <select id='adminSucursal' class='adminInput'>
+        <option value=''>Todas</option>
+      </select>
+
       <button class='btn' onclick='loadAdminAcceptedByDay()'>Buscar</button>
       <span class='muted' id='adminHint'></span>
     </div>
@@ -591,16 +596,33 @@ async function ackTransfer(id, btn) {
 }
 
 // ===== ADMIN =====
+async function loadAdminSucursales() {
+  const sel = document.getElementById('adminSucursal');
+  if (!sel) return;
+
+  try {
+    const r = await fetch('/api/transfers/admin/sucursales');
+    const j = await r.json();
+    if (!r.ok || !j.ok) return;
+
+    const options = (j.items || []).map(u => `<option value="${u}">${u}</option>`).join('');
+    sel.innerHTML = `<option value=''>Todas</option>` + options;
+  } catch {}
+}
+
 async function loadAdminAcceptedByDay() {
   const input = document.getElementById('adminDate');
+  const sel = document.getElementById('adminSucursal');
   const body = document.getElementById('adminAcceptedBody');
   const total = document.getElementById('adminTotal');
   const cant = document.getElementById('adminCant');
   const hint = document.getElementById('adminHint');
 
-  if (!input || !body) return; // no es admin (no existe el bloque)
+  if (!input || !body) return;
 
   const date = input.value;
+  const suc = sel ? sel.value : "";
+
   if (!date) {
     hint.textContent = 'Elegí una fecha.';
     return;
@@ -609,7 +631,11 @@ async function loadAdminAcceptedByDay() {
 
   try {
     body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>`;
-    const r = await fetch(`/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`);
+
+    let url = `/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`;
+    if (suc) url += `&sucursal=${encodeURIComponent(suc)}`;
+
+    const r = await fetch(url);
     const j = await r.json();
 
     if (!r.ok || !j.ok) throw new Error(j?.message || 'Error admin accepted/by-day');
@@ -618,7 +644,7 @@ async function loadAdminAcceptedByDay() {
     cant.textContent = (j.count || 0);
 
     if (!j.items || j.items.length === 0) {
-      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese día.</div></td></tr>`;
+      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese filtro.</div></td></tr>`;
       return;
     }
 
@@ -642,7 +668,6 @@ async function loadAdminAcceptedByDay() {
 function setAdminDefaultDateToday() {
   const input = document.getElementById('adminDate');
   if (!input) return;
-  // Fecha local del navegador (AR si estás en AR)
   const now = new Date();
   const yyyy = now.getFullYear();
   const mm = String(now.getMonth()+1).padStart(2,'0');
@@ -658,8 +683,9 @@ async function refreshAll() {
 refreshAll();
 setInterval(refreshAll, 8000);
 
-// si es admin, seteamos hoy por defecto y traemos el día automáticamente
+// si es admin, cargamos el combo y traemos hoy por defecto
 setAdminDefaultDateToday();
+loadAdminSucursales();
 loadAdminAcceptedByDay();
 </script>
 
@@ -672,6 +698,5 @@ loadAdminAcceptedByDay();
 
     return Results.Content(html, "text/html; charset=utf-8");
 });
-
 
 app.Run();
