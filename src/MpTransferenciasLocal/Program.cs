@@ -39,7 +39,16 @@ builder.Configuration.AddEnvironmentVariables();
 // ================= SERVICES =================
 builder.Services.AddControllers();
 builder.Services.AddAuthorization();
+
+// ✅ NECESARIO para MpPollingService (IHttpClientFactory)
+builder.Services.AddHttpClient("MP", c =>
+{
+    c.BaseAddress = new Uri("https://api.mercadopago.com/");
+});
+
+// Polling (tu clase existente)
 builder.Services.AddHostedService<MpPollingService>();
+
 
 // ================= HELPERS =================
 static bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
