@@ -262,8 +262,7 @@ app.MapGet("/favicon.ico", () => Results.NoContent());
 
 app.MapControllers();
 
-// ✅ HOME (Pendientes + Aceptadas hoy + ADMIN con estética vieja)
-// Importante: como "/" es público, el ADMIN se muestra/oculta por JS probando endpoints admin
+// ✅ HOME (Pendientes + Aceptadas hoy + ADMIN)
 app.MapGet("/", (IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
@@ -285,7 +284,6 @@ app.MapGet("/", (IConfiguration cfg) =>
 </div>
 """;
 
-    // Lo envolvemos en #adminSection para mostrarlo SOLO si sos admin (por JS)
     var adminHtml = """
 <div id='adminSection' style='display:none;'>
   <div class='sectionTitle adminTitle'>
@@ -346,7 +344,6 @@ app.MapGet("/", (IConfiguration cfg) =>
 </div>
 """;
 
-
     var html = $$"""
 <!doctype html>
 <html lang='es'>
@@ -379,7 +376,7 @@ body{
   background:linear-gradient(90deg, rgba(34,197,94,.16), transparent 60%);
   border-bottom:1px solid var(--border);
 }
-.titleRow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.titleRow{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
 h1{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}
 .sub{margin-top:6px;color:rgba(226,232,240,.9);font-size:14px;font-weight:600}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
@@ -411,7 +408,7 @@ h1{margin:0;font-size:30px;letter-spacing:.3px;font-weight:900}
 }
 .badge b{color:#fff}
 .tableWrap{overflow:auto}
-table{width:100%;border-collapse:collapse;min-width:860px}
+table{width:100%;border-collapse:collapse;min-width:900px}
 thead th{position:sticky;top:0;z-index:1;background:rgba(15,23,42,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
 th,td{padding:12px 14px;border-bottom:1px solid rgba(31,41,55,.85);font-size:14.5px;white-space:nowrap}
 tbody tr:nth-child(odd){background:rgba(255,255,255,.015)}
@@ -470,13 +467,13 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
   h1{font-size:24px}
   .accountBox{grid-template-columns:1fr}
   .v{font-size:16px}
-  table{min-width:740px}
+  table{min-width:780px}
 }
 </style>
 </head>
 <body>
 
-<!-- ✅ LOGIN (sin cambiar estética general) -->
+<!-- ✅ LOGIN (overlay, sin popup navegador) -->
 <div id="loginOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.86);display:none;align-items:center;justify-content:center;z-index:9999;">
   <div style="width:340px;max-width:92vw;background:var(--card);border:1px solid var(--border);border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,.35);padding:16px;">
     <div style="font-weight:900;font-size:18px;margin-bottom:10px;">Iniciar sesión</div>
@@ -492,9 +489,19 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
   <div class='card'>
     <div class='header'>
       <div class='titleRow'>
-        <h1>MP Transferencias</h1>
-        <div class='sub'>Pendientes (últimos <b>10 min</b>) · Actualiza cada <b>8</b> segundos</div>
+        <div>
+          <h1>MP Transferencias · {{cuenta}}</h1>
+          <div class='sub'>
+            Pendientes (últimos <b>10 min</b>) · Actualiza cada <b>8</b> segundos ·
+            Usuario: <b id="who" class="mono">—</b>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn btnDanger" onclick="logout()" title="Cerrar sesión">Logout</button>
+        </div>
       </div>
+
       {{accountBoxHtml}}
     </div>
 
@@ -522,7 +529,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
     </div>
 
     <div class='sectionTitle'>
-      <h2>Aceptadas hoy</h2>
+      <h2>Aceptadas hoy (por vos)</h2>
       <div class='badge'>Total hoy: <b id='totalHoy'>$0</b> · Cant: <b id='cantHoy'>0</b></div>
     </div>
 
@@ -569,7 +576,35 @@ function showLogin(msg){
   ov.style.display = 'flex';
 }
 function hideLogin(){ document.getElementById('loginOverlay').style.display = 'none'; }
-function logout(){ AUTH=''; sessionStorage.removeItem('AUTH'); showLogin(''); }
+
+// ✅ NUEVO: mostrar usuario actual desde AUTH
+function setWhoFromAuth(){
+  const el = document.getElementById('who');
+  if (!el) return;
+
+  try{
+    if (!AUTH) { el.textContent = '—'; return; }
+    const token = AUTH.replace(/^Basic\s+/i,'').trim();
+    const decoded = decodeURIComponent(escape(atob(token))); // "user:pass"
+    const user = decoded.split(':',2)[0] || '—';
+    el.textContent = user;
+  }catch{
+    el.textContent = '—';
+  }
+}
+
+// ✅ NUEVO: limpiar auth centralizado
+function clearAuth(){
+  AUTH = '';
+  sessionStorage.removeItem('AUTH');
+  setWhoFromAuth();
+}
+
+// ✅ NUEVO: logout real
+function logout(){
+  clearAuth();
+  showLogin('Sesión cerrada');
+}
 
 async function apiFetch(url, opts){
   opts = opts || {};
@@ -579,8 +614,7 @@ async function apiFetch(url, opts){
   const r = await fetch(url, opts);
 
   if (r.status === 401){
-    AUTH = '';
-    sessionStorage.removeItem('AUTH');
+    clearAuth();                 // ✅ NUEVO
     showLogin('Iniciá sesión');
     throw new Error('401');
   }
@@ -603,9 +637,11 @@ async function login(){
 
   try{
     await apiJson('/api/transfers/ping');
+    setWhoFromAuth();          // ✅ NUEVO
     hideLogin();
     await initAfterLogin();
   }catch{
+    clearAuth();               // ✅ NUEVO
     showLogin('Usuario o clave inválidos');
   }
 }
@@ -719,7 +755,7 @@ async function ackTransfer(id, btn) {
   }
 }
 
-// ===== ADMIN (lógica igual, solo usando apiJson con Authorization) =====
+// ===== ADMIN =====
 async function loadAdminSucursales() {
   const sel = document.getElementById('adminSucursal');
   if (!sel) return;
@@ -751,7 +787,7 @@ async function loadAdminAcceptedByDay() {
   if (hint) hint.textContent = '';
 
   try {
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>`;
+    body.innerHTML = `<tr><td colspan='7'><div class='errorBox'>Cargando…</div></td></tr>`;
 
     let url = `/api/transfers/admin/accepted/by-day?date=${encodeURIComponent(date)}`;
     if (suc) url += `&sucursal=${encodeURIComponent(suc)}`;
@@ -762,24 +798,23 @@ async function loadAdminAcceptedByDay() {
     cant.textContent = (j.count || 0);
 
     if (!j.items || j.items.length === 0) {
-      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No hay aceptadas para ese filtro.</div></td></tr>`;
+      body.innerHTML = `<tr><td colspan='7'><div class='errorBox'>No hay aceptadas para ese filtro.</div></td></tr>`;
       return;
     }
 
     body.innerHTML = j.items.map(x => `
-  <tr>
-    <td class='mono'>${toArDate(x.fecha_utc)}</td>
-    <td class='money'>${arMoney.format(x.monto)}</td>
-    <td>${x.payment_type}</td>
-    <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
-    <td class='mono'>${(x.mp_account_nombre && x.mp_account_nombre.trim()) ? x.mp_account_nombre : ('ID ' + (x.mp_account_id ?? ''))}</td>
-    <td class='mono'>${x.accepted_by || ''}</td>
-    <td class='muted mono'>${x.payment_id}</td>
-  </tr>
-`).join('');
-
+      <tr>
+        <td class='mono'>${toArDate(x.fecha_utc)}</td>
+        <td class='money'>${arMoney.format(x.monto)}</td>
+        <td>${x.payment_type}</td>
+        <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
+        <td class='mono'>${(x.mp_account_nombre && x.mp_account_nombre.trim()) ? x.mp_account_nombre : ('ID ' + (x.mp_account_id ?? ''))}</td>
+        <td class='mono'>${x.accepted_by || ''}</td>
+        <td class='muted mono'>${x.payment_id}</td>
+      </tr>
+    `).join('');
   } catch (e) {
-    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
+    body.innerHTML = `<tr><td colspan='7'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
     total.textContent = '$0';
     cant.textContent = '0';
   }
@@ -834,7 +869,7 @@ async function assignMpAccountToSucursal() {
   try {
     if (badge) badge.textContent = 'Asignando...';
 
-    const j = await apiJson('/api/transfers/admin/assign-mp-account', {
+    await apiJson('/api/transfers/admin/assign-mp-account', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: suc, mpAccountId: Number(acc) })
@@ -854,7 +889,6 @@ async function refreshAll() {
 }
 
 async function initAdminIfPossible(){
-  // Si NO sos admin, esta llamada va a fallar (401/403) y ocultamos el panel
   try{
     await apiJson('/api/transfers/admin/sucursales');
     document.getElementById('adminSection').style.display = 'block';
@@ -877,6 +911,8 @@ async function initAfterLogin(){
 
 // init general
 (async function init(){
+  setWhoFromAuth(); // ✅ NUEVO: mostrar usuario al cargar
+
   if (AUTH){
     try{
       await apiJson('/api/transfers/ping');
