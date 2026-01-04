@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Security.Claims;
 using System.Text;
@@ -118,8 +119,14 @@ static string NormalizeConnString(IConfiguration cfg)
             Password = pass,
             Database = db,
             SslMode = SslMode.Require,
+
+            // ✅ estabilidad
             Timeout = 10,
-            CommandTimeout = 10
+            CommandTimeout = 10,
+
+            // ✅ pooling (reduce microcortes)
+            Pooling = true,
+            MaxPoolSize = 50
         };
 
         return b.ConnectionString;
@@ -130,49 +137,24 @@ static string NormalizeConnString(IConfiguration cfg)
     {
         SslMode = SslMode.Require,
         Timeout = 10,
-        CommandTimeout = 10
+        CommandTimeout = 10,
+        Pooling = true,
+        MaxPoolSize = 50
     }.ConnectionString;
-}
-
-// ✅ Valida usuario/clave contra DB usando BCrypt
-static async Task<(bool ok, string? role)> ValidateUserFromDbAsync(
-    IConfiguration cfg,
-    string username,
-    string password)
-{
-    var cs = NormalizeConnString(cfg);
-
-    await using var conn = new NpgsqlConnection(cs);
-    await conn.OpenAsync();
-
-    var sql = """
-        select role, password_hash
-        from app_users
-        where username = @u
-        limit 1;
-    """;
-
-    await using var cmd = new NpgsqlCommand(sql, conn);
-    cmd.Parameters.AddWithValue("u", username);
-
-    await using var rd = await cmd.ExecuteReaderAsync();
-    if (!await rd.ReadAsync())
-        return (false, null);
-
-    var role = rd.IsDBNull(0) ? null : rd.GetString(0);
-    var hash = rd.IsDBNull(1) ? "" : rd.GetString(1);
-
-    if (string.IsNullOrWhiteSpace(hash))
-        return (false, role);
-
-    var ok = BCrypt.Net.BCrypt.Verify(password, hash);
-    return (ok, role);
 }
 
 // ✅ 401 JSON SIN WWW-Authenticate => NO popup navegador
 static async Task Json401(HttpContext ctx, string msg)
 {
     ctx.Response.StatusCode = 401;
+    ctx.Response.ContentType = "application/json; charset=utf-8";
+    await ctx.Response.WriteAsync($$"""{"ok":false,"message":"{{msg}}"}""");
+}
+
+// ✅ 503 JSON (DB caída/lenta) => NO desloguear
+static async Task Json503(HttpContext ctx, string msg)
+{
+    ctx.Response.StatusCode = 503;
     ctx.Response.ContentType = "application/json; charset=utf-8";
     await ctx.Response.WriteAsync($$"""{"ok":false,"message":"{{msg}}"}""");
 }
@@ -193,7 +175,10 @@ catch (Exception ex)
 }
 
 // ================= AUTH (Basic) - POR DB =================
-// ✅ CAMBIO CLAVE: SOLO /api/* y sin WWW-Authenticate (sin popup)
+// ✅ SOLO /api/* y sin WWW-Authenticate (sin popup)
+// ✅ Cache 60s para no consultar DB en cada request (clave para estabilidad)
+var authCache = new ConcurrentDictionary<string, (DateTimeOffset exp, string? role, string hash)>(StringComparer.OrdinalIgnoreCase);
+
 app.Use(async (ctx, next) =>
 {
     // permitir health y home sin auth
@@ -222,8 +207,45 @@ app.Use(async (ctx, next) =>
 
     try
     {
-        var (ok, role) = await ValidateUserFromDbAsync(app.Configuration, user, pass);
+        // 1) cache (60s)
+        if (!authCache.TryGetValue(user, out var cached) || cached.exp <= DateTimeOffset.UtcNow)
+        {
+            var cs = NormalizeConnString(app.Configuration);
+            await using var conn = new NpgsqlConnection(cs);
+            await conn.OpenAsync();
 
+            var sql = """
+                select role, password_hash
+                from app_users
+                where username = @u
+                limit 1;
+            """;
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("u", user);
+
+            await using var rd = await cmd.ExecuteReaderAsync();
+            if (!await rd.ReadAsync())
+            {
+                await Json401(ctx, "Credenciales inválidas");
+                return;
+            }
+
+            var role = rd.IsDBNull(0) ? null : rd.GetString(0);
+            var hash = rd.IsDBNull(1) ? "" : rd.GetString(1);
+
+            if (string.IsNullOrWhiteSpace(hash))
+            {
+                await Json401(ctx, "Credenciales inválidas");
+                return;
+            }
+
+            cached = (DateTimeOffset.UtcNow.AddSeconds(60), role, hash);
+            authCache[user] = cached;
+        }
+
+        // 2) validate bcrypt contra hash cacheado
+        var ok = BCrypt.Net.BCrypt.Verify(pass, cached.hash);
         if (!ok)
         {
             await Json401(ctx, "Credenciales inválidas");
@@ -233,7 +255,7 @@ app.Use(async (ctx, next) =>
         var claims = new List<Claim>
         {
             new(ClaimTypes.Name, user),
-            new(ClaimTypes.Role, string.IsNullOrWhiteSpace(role) ? "sucursal" : role!)
+            new(ClaimTypes.Role, string.IsNullOrWhiteSpace(cached.role) ? "sucursal" : cached.role!)
         };
 
         ctx.User = new ClaimsPrincipal(new ClaimsIdentity(claims, "Basic"));
@@ -241,8 +263,10 @@ app.Use(async (ctx, next) =>
     }
     catch (Exception ex)
     {
+        // ✅ CLAVE: si falla DB/red NO es 401 (no desloguear)
         Console.WriteLine("⚠ Auth DB error: " + ex.Message);
-        await Json401(ctx, "Error autenticando");
+        await Json503(ctx, "DB no disponible. Reintentá en unos segundos.");
+        return;
     }
 });
 
@@ -577,7 +601,7 @@ function showLogin(msg){
 }
 function hideLogin(){ document.getElementById('loginOverlay').style.display = 'none'; }
 
-// ✅ NUEVO: mostrar usuario actual desde AUTH
+// mostrar usuario actual desde AUTH
 function setWhoFromAuth(){
   const el = document.getElementById('who');
   if (!el) return;
@@ -593,14 +617,12 @@ function setWhoFromAuth(){
   }
 }
 
-// ✅ NUEVO: limpiar auth centralizado
 function clearAuth(){
   AUTH = '';
   sessionStorage.removeItem('AUTH');
   setWhoFromAuth();
 }
 
-// ✅ NUEVO: logout real
 function logout(){
   clearAuth();
   showLogin('Sesión cerrada');
@@ -613,11 +635,31 @@ async function apiFetch(url, opts){
 
   const r = await fetch(url, opts);
 
-  if (r.status === 401){
-    clearAuth();                 // ✅ NUEVO
-    showLogin('Iniciá sesión');
-    throw new Error('401');
+  // ✅ DB caída/lenta => NO desloguear
+  if (r.status === 503){
+    throw new Error('DB no disponible. Reintentando...');
   }
+
+  if (r.status === 401){
+    let msg = '';
+    try{
+      const j = await r.clone().json();
+      msg = j?.message ? String(j.message) : '';
+    }catch{}
+
+    // ✅ Solo forzar login si realmente es credencial/auth faltante
+    const mustRelog = /Falta Authorization|Credenciales/i.test(msg) || msg === '';
+
+    if (mustRelog){
+      clearAuth();
+      showLogin('Iniciá sesión');
+    } else {
+      // 401 raro: no limpiar sesión
+      console.warn('401:', msg);
+    }
+    throw new Error(msg || '401');
+  }
+
   return r;
 }
 
@@ -637,11 +679,11 @@ async function login(){
 
   try{
     await apiJson('/api/transfers/ping');
-    setWhoFromAuth();          // ✅ NUEVO
+    setWhoFromAuth();
     hideLogin();
     await initAfterLogin();
   }catch{
-    clearAuth();               // ✅ NUEVO
+    clearAuth();
     showLogin('Usuario o clave inválidos');
   }
 }
@@ -911,7 +953,7 @@ async function initAfterLogin(){
 
 // init general
 (async function init(){
-  setWhoFromAuth(); // ✅ NUEVO: mostrar usuario al cargar
+  setWhoFromAuth();
 
   if (AUTH){
     try{
