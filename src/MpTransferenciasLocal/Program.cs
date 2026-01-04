@@ -285,7 +285,6 @@ app.MapGet("/", (IConfiguration cfg) =>
 </div>
 """;
 
-    // ✅ ESTE es el bloque ADMIN “viejo” (estética vieja)
     // Lo envolvemos en #adminSection para mostrarlo SOLO si sos admin (por JS)
     var adminHtml = """
 <div id='adminSection' style='display:none;'>
@@ -334,17 +333,19 @@ app.MapGet("/", (IConfiguration cfg) =>
           <th>Monto</th>
           <th>Medio</th>
           <th>Estado</th>
+          <th>Cuenta</th>
           <th>Aceptada por</th>
           <th class='muted'>Payment ID</th>
         </tr>
       </thead>
       <tbody id='adminAcceptedBody'>
-        <tr><td colspan='6'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
+        <tr><td colspan='7'><div class='errorBox'>Elegí un día para ver las aceptadas (todas).</div></td></tr>
       </tbody>
     </table>
   </div>
 </div>
 """;
+
 
     var html = $$"""
 <!doctype html>
@@ -491,8 +492,8 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
   <div class='card'>
     <div class='header'>
       <div class='titleRow'>
-        <h1>MP Transferencias · {{cuenta}}</h1>
-        <div class='sub'>Pendientes (últimas <b>20</b>) · Actualiza cada <b>8</b> segundos</div>
+        <h1>MP Transferencias</h1>
+        <div class='sub'>Pendientes (últimos <b>10 min</b>) · Actualiza cada <b>8</b> segundos</div>
       </div>
       {{accountBoxHtml}}
     </div>
@@ -521,7 +522,7 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
     </div>
 
     <div class='sectionTitle'>
-      <h2>Aceptadas hoy (por vos)</h2>
+      <h2>Aceptadas hoy</h2>
       <div class='badge'>Total hoy: <b id='totalHoy'>$0</b> · Cant: <b id='cantHoy'>0</b></div>
     </div>
 
@@ -766,15 +767,17 @@ async function loadAdminAcceptedByDay() {
     }
 
     body.innerHTML = j.items.map(x => `
-      <tr>
-        <td class='mono'>${toArDate(x.fecha_utc)}</td>
-        <td class='money'>${arMoney.format(x.monto)}</td>
-        <td>${x.payment_type}</td>
-        <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
-        <td class='mono'>${x.accepted_by || ''}</td>
-        <td class='muted mono'>${x.payment_id}</td>
-      </tr>
-    `).join('');
+  <tr>
+    <td class='mono'>${toArDate(x.fecha_utc)}</td>
+    <td class='money'>${arMoney.format(x.monto)}</td>
+    <td>${x.payment_type}</td>
+    <td><span class='pill ${pillClass(x.status)}'>${x.status}</span></td>
+    <td class='mono'>${(x.mp_account_nombre && x.mp_account_nombre.trim()) ? x.mp_account_nombre : ('ID ' + (x.mp_account_id ?? ''))}</td>
+    <td class='mono'>${x.accepted_by || ''}</td>
+    <td class='muted mono'>${x.payment_id}</td>
+  </tr>
+`).join('');
+
   } catch (e) {
     body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
     total.textContent = '$0';
