@@ -163,7 +163,9 @@ public class TransfersController : ControllerBase
     // Sucursal: ver SOLO su cuenta asignada
     // ==============================
 
-    // Pendientes (no aceptadas por nadie) - FILTRA por cuenta asignada
+    // ✅ Pendientes (no aceptadas por nadie) - FILTRA por cuenta asignada
+    // ✅ SOLO transferencias (bank_transfer, account_money)
+    // ✅ SOLO últimas 10 minutos (por fecha_utc)
     // GET /api/transfers/pending?limit=20
     [HttpGet("pending")]
     public async Task<IActionResult> Pending([FromQuery] int limit = 20)
@@ -182,6 +184,12 @@ public class TransfersController : ControllerBase
             left join transfer_ack a on a.transfer_id = t.id
             where a.transfer_id is null
               and t.mp_account_id = @acc
+
+              -- ✅ SOLO transferencias (excluye credit_card, debit_card, prepaid_card, etc.)
+              and t.payment_type in ('bank_transfer', 'account_money')
+
+              -- ✅ SOLO últimos 10 minutos (fecha_utc en UTC)
+              and t.fecha_utc >= (now() at time zone 'utc') - interval '10 minutes'
             order by t.id desc
             limit @limit;
         """;
@@ -461,8 +469,6 @@ public class TransfersController : ControllerBase
     // Admin
     // ==============================
 
-    // ADMIN: aceptadas por día + filtro por sucursal(username)
-    // GET /api/transfers/admin/accepted/by-day?date=2026-01-03&sucursal=Banfield
     [HttpGet("admin/accepted/by-day")]
     [Authorize(Roles = "admin")]
     public async Task<IActionResult> AdminAcceptedByDay([FromQuery] string date, [FromQuery] string? sucursal = null)
@@ -527,8 +533,6 @@ public class TransfersController : ControllerBase
         return Ok(new { ok = true, date, sucursal = sucursal ?? "", count = items.Count, total, items });
     }
 
-    // ADMIN: lista de sucursales/usuarios
-    // GET /api/transfers/admin/sucursales
     [HttpGet("admin/sucursales")]
     [Authorize(Roles = "admin")]
     public async Task<IActionResult> AdminSucursales()
@@ -553,8 +557,6 @@ public class TransfersController : ControllerBase
         return Ok(new { ok = true, items });
     }
 
-    // ADMIN: listar cuentas MP (para dropdown)
-    // GET /api/transfers/admin/mp-accounts
     [HttpGet("admin/mp-accounts")]
     [Authorize(Roles = "admin")]
     public async Task<IActionResult> AdminMpAccounts()
@@ -587,8 +589,6 @@ public class TransfersController : ControllerBase
         return Ok(new { ok = true, items });
     }
 
-    // ADMIN: asignar cuenta MP a una sucursal
-    // POST /api/transfers/admin/assign-mp-account
     [HttpPost("admin/assign-mp-account")]
     [Authorize(Roles = "admin")]
     public async Task<IActionResult> AssignMpAccount([FromBody] AssignMpAccountDto dto)
@@ -620,7 +620,6 @@ public class TransfersController : ControllerBase
     // MP Debug (opcional)
     // ==============================
 
-    // GET /api/transfers/mp/me
     [HttpGet("mp/me")]
     public async Task<IActionResult> MpMe()
     {
@@ -641,7 +640,6 @@ public class TransfersController : ControllerBase
         }
     }
 
-    // GET /api/transfers/mp/search?minutes=60&payment_type_id=bank_transfer
     [HttpGet("mp/search")]
     public async Task<IActionResult> MpSearch([FromQuery] int minutes = 60, [FromQuery(Name = "payment_type_id")] string paymentTypeId = "bank_transfer")
     {
