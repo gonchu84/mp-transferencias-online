@@ -1,0 +1,13 @@
+# Build
+bin/
+obj/
+
+# Config local (NO subir secretos)
+config/
+appsettings.Development.json
+
+# IDE
+.vscode/
+.idea/
+*.user
+*.suo

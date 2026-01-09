@@ -19,6 +19,10 @@ public class TransfersController : ControllerBase
     // DTOs
     public record AssignMpAccountDto(string Username, int MpAccountId);
 
+    // ✅ Manual transfers DTOs
+    public record ManualTransferCreateDto(string PayerName, decimal Amount);
+    public record ManualTransferDecisionDto(string? Note);
+
     // ==============================
     // Connection / Helpers
     // ==============================
@@ -99,6 +103,14 @@ public class TransfersController : ControllerBase
         return Convert.ToInt32(obj);
     }
 
+    private static DateTime GetTodayArDate()
+    {
+        // Date AR en el server/DB (ideal) pero para mensajes y validaciones rápidas
+        var tz = GetArTz();
+        var nowAr = TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, tz);
+        return nowAr.Date;
+    }
+
     // ==============================
     // Básicos
     // ==============================
@@ -160,6 +172,91 @@ public class TransfersController : ControllerBase
     }
 
     // ==============================
+    // ✅ Manual transfers (nuevo)
+    // ==============================
+
+    // Crear transferencia manual (cualquier usuario)
+    // POST /api/transfers/manual
+    [HttpPost("manual")]
+    public async Task<IActionResult> CreateManual([FromBody] ManualTransferCreateDto dto)
+    {
+        var username = User.Identity?.Name ?? "unknown";
+
+        if (dto == null || string.IsNullOrWhiteSpace(dto.PayerName))
+            return BadRequest(new { ok = false, message = "Nombre requerido" });
+
+        if (dto.Amount <= 0)
+            return BadRequest(new { ok = false, message = "Monto inválido" });
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+            insert into manual_transfers (created_by, payer_name, amount, status)
+            values (@u, @n, @a, 'pending_admin')
+            returning id, created_at;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("u", username);
+        cmd.Parameters.AddWithValue("n", dto.PayerName.Trim());
+        cmd.Parameters.AddWithValue("a", dto.Amount);
+
+        await using var rd = await cmd.ExecuteReaderAsync();
+        await rd.ReadAsync();
+
+        return Ok(new
+        {
+            ok = true,
+            id = rd.GetInt64(0),
+            created_at = rd.GetFieldValue<DateTimeOffset>(1).ToString("o"),
+            status = "pending_admin"
+        });
+    }
+
+    // Ver mis manuales de HOY (para que el usuario vea pendientes/aprobadas/rechazadas)
+    // GET /api/transfers/manual/mine/today
+    [HttpGet("manual/mine/today")]
+    public async Task<IActionResult> MyManualToday()
+    {
+        var username = User.Identity?.Name ?? "unknown";
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+            select id, created_at, payer_name, amount, status, admin_decided_at, admin_decided_by, admin_note
+            from manual_transfers
+            where created_by = @u
+              and (created_at at time zone 'America/Argentina/Buenos_Aires')::date
+                    = (now() at time zone 'America/Argentina/Buenos_Aires')::date
+            order by created_at desc;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("u", username);
+
+        var items = new List<object>();
+        await using var rd = await cmd.ExecuteReaderAsync();
+        while (await rd.ReadAsync())
+        {
+            items.Add(new
+            {
+                id = rd.GetInt64(0),
+                fecha_utc = rd.GetFieldValue<DateTimeOffset>(1).ToString("o"),
+                payer_name = rd.GetString(2),
+                monto = rd.GetDecimal(3),
+                status = rd.GetString(4),
+                admin_decided_at = rd.IsDBNull(5) ? null : rd.GetFieldValue<DateTimeOffset>(5).ToString("o"),
+                admin_decided_by = rd.IsDBNull(6) ? null : rd.GetString(6),
+                admin_note = rd.IsDBNull(7) ? null : rd.GetString(7)
+            });
+        }
+
+        return Ok(new { ok = true, username, count = items.Count, items });
+    }
+
+    // ==============================
     // Sucursal: ver SOLO su cuenta asignada
     // ==============================
 
@@ -216,7 +313,8 @@ public class TransfersController : ControllerBase
         return Ok(new { ok = true, mp_account_id = mpAccountId, count = items.Count, items });
     }
 
-    // Aceptadas HOY por el usuario - FILTRA por cuenta asignada
+    // ✅ Aceptadas HOY por el usuario
+    // - Incluye: (A) MP aceptadas (transfer_ack) + (B) Manuales aprobadas por admin
     // GET /api/transfers/accepted/today
     [HttpGet("accepted/today")]
     public async Task<IActionResult> AcceptedToday()
@@ -228,16 +326,53 @@ public class TransfersController : ControllerBase
 
         var mpAccountId = await GetUserMpAccountId(conn, username);
 
+        // (A) MP acks del día AR + (B) manual approved del día AR
         var sql = """
-            select
-                t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
-                a.username, a.ack_at_utc, a.ack_date_ar
-            from transfer_ack a
-            join transfers t on t.id = a.transfer_id
-            where a.username = @username
-              and a.ack_date_ar = (now() at time zone 'America/Argentina/Buenos_Aires')::date
-              and t.mp_account_id = @acc
-            order by a.ack_at_utc desc;
+            with ar_day as (
+              select (now() at time zone 'America/Argentina/Buenos_Aires')::date as day
+            )
+            select *
+            from (
+              -- A) MP aceptadas por el usuario (filtra cuenta asignada)
+              select
+                t.id::bigint as id,
+                t.payment_id::text as payment_id,
+                t.fecha_utc as fecha_utc,
+                t.monto as monto,
+                t.payment_type::text as payment_type,
+                t.status::text as status,
+                a.username::text as accepted_by,
+                a.ack_at_utc as ack_at_utc,
+                a.ack_date_ar as ack_date_ar,
+                0::int as source_order
+              from transfer_ack a
+              join transfers t on t.id = a.transfer_id
+              join ar_day d on true
+              where a.username = @username
+                and a.ack_date_ar = d.day
+                and t.mp_account_id = @acc
+
+              union all
+
+              -- B) Manuales aprobadas (por admin) creadas por el usuario (día AR)
+              select
+                mt.id::bigint as id,
+                ('MANUAL-' || mt.id::text) as payment_id,
+                mt.created_at as fecha_utc,
+                mt.amount as monto,
+                'manual'::text as payment_type,
+                mt.status::text as status,
+                mt.created_by::text as accepted_by,
+                mt.admin_decided_at as ack_at_utc,
+                (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date as ack_date_ar,
+                1::int as source_order
+              from manual_transfers mt
+              join ar_day d on true
+              where mt.created_by = @username
+                and mt.status = 'approved'
+                and (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date = d.day
+            ) x
+            order by x.ack_at_utc desc nulls last, x.source_order asc;
         """;
 
         await using var cmd = new NpgsqlCommand(sql, conn);
@@ -262,7 +397,7 @@ public class TransfersController : ControllerBase
                 payment_type = rd.GetString(4),
                 status = rd.GetString(5),
                 accepted_by = rd.GetString(6),
-                ack_at_utc = rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
+                ack_at_utc = rd.IsDBNull(7) ? null : rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
                 ack_date_ar = rd.GetFieldValue<DateTime>(8).ToString("yyyy-MM-dd")
             });
         }
@@ -270,7 +405,8 @@ public class TransfersController : ControllerBase
         return Ok(new { ok = true, username, mp_account_id = mpAccountId, count = items.Count, total, items });
     }
 
-    // Aceptadas por día (usuario logueado) - FILTRA por cuenta asignada
+    // ✅ Aceptadas por día (usuario logueado)
+    // - Incluye MP + Manuales aprobadas
     // GET /api/transfers/accepted/by-day?date=2025-12-31
     [HttpGet("accepted/by-day")]
     public async Task<IActionResult> AcceptedByDay([FromQuery] string date)
@@ -286,15 +422,46 @@ public class TransfersController : ControllerBase
         var mpAccountId = await GetUserMpAccountId(conn, username);
 
         var sql = """
-            select
-                t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
-                a.username, a.ack_at_utc, a.ack_date_ar
-            from transfer_ack a
-            join transfers t on t.id = a.transfer_id
-            where a.username = @username
-              and a.ack_date_ar = @day::date
-              and t.mp_account_id = @acc
-            order by a.ack_at_utc desc;
+            select *
+            from (
+              -- A) MP aceptadas
+              select
+                t.id::bigint as id,
+                t.payment_id::text as payment_id,
+                t.fecha_utc as fecha_utc,
+                t.monto as monto,
+                t.payment_type::text as payment_type,
+                t.status::text as status,
+                a.username::text as accepted_by,
+                a.ack_at_utc as ack_at_utc,
+                a.ack_date_ar as ack_date_ar,
+                0::int as source_order
+              from transfer_ack a
+              join transfers t on t.id = a.transfer_id
+              where a.username = @username
+                and a.ack_date_ar = @day::date
+                and t.mp_account_id = @acc
+
+              union all
+
+              -- B) Manuales aprobadas (día AR por created_at)
+              select
+                mt.id::bigint as id,
+                ('MANUAL-' || mt.id::text) as payment_id,
+                mt.created_at as fecha_utc,
+                mt.amount as monto,
+                'manual'::text as payment_type,
+                mt.status::text as status,
+                mt.created_by::text as accepted_by,
+                mt.admin_decided_at as ack_at_utc,
+                (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date as ack_date_ar,
+                1::int as source_order
+              from manual_transfers mt
+              where mt.created_by = @username
+                and mt.status = 'approved'
+                and (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date = @day::date
+            ) x
+            order by x.ack_at_utc desc nulls last, x.source_order asc;
         """;
 
         await using var cmd = new NpgsqlCommand(sql, conn);
@@ -320,7 +487,7 @@ public class TransfersController : ControllerBase
                 payment_type = rd.GetString(4),
                 status = rd.GetString(5),
                 accepted_by = rd.GetString(6),
-                ack_at_utc = rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
+                ack_at_utc = rd.IsDBNull(7) ? null : rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
                 ack_date_ar = rd.GetFieldValue<DateTime>(8).ToString("yyyy-MM-dd")
             });
         }
@@ -469,7 +636,129 @@ public class TransfersController : ControllerBase
     // Admin
     // ==============================
 
+    // ✅ ADMIN: manual pendientes (por día AR)
+    // GET /api/transfers/admin/manual/pending?date=2026-01-08
+    [HttpGet("admin/manual/pending")]
+    [Authorize(Roles = "admin")]
+    public async Task<IActionResult> AdminManualPending([FromQuery] string? date = null)
+    {
+        DateTime? day = null;
+        if (!string.IsNullOrWhiteSpace(date))
+        {
+            if (!DateTime.TryParseExact(date, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed))
+                return BadRequest(new { ok = false, message = "Formato inválido. Usá yyyy-MM-dd", date });
+            day = parsed.Date;
+        }
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        // default hoy AR si no viene date
+        var sql = """
+            with d as (
+              select
+                case
+                  when @day is null then (now() at time zone 'America/Argentina/Buenos_Aires')::date
+                  else @day::date
+                end as day
+            )
+            select mt.id, mt.created_at, mt.created_by, mt.payer_name, mt.amount
+            from manual_transfers mt, d
+            where mt.status = 'pending_admin'
+              and (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date = d.day
+            order by mt.created_at asc;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("day", (object?)day ?? DBNull.Value);
+
+        var items = new List<object>();
+        await using var rd = await cmd.ExecuteReaderAsync();
+        while (await rd.ReadAsync())
+        {
+            items.Add(new
+            {
+                id = rd.GetInt64(0),
+                fecha_utc = rd.GetFieldValue<DateTimeOffset>(1).ToString("o"),
+                created_by = rd.GetString(2),
+                payer_name = rd.GetString(3),
+                monto = rd.GetDecimal(4)
+            });
+        }
+
+        return Ok(new { ok = true, count = items.Count, items });
+    }
+
+    // ✅ ADMIN: aprobar manual
+    // POST /api/transfers/admin/manual/{id}/approve
+    [HttpPost("admin/manual/{id:long}/approve")]
+    [Authorize(Roles = "admin")]
+    public async Task<IActionResult> AdminManualApprove(long id, [FromBody] ManualTransferDecisionDto? dto)
+    {
+        var admin = User.Identity?.Name ?? "admin";
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+            update manual_transfers
+            set status = 'approved',
+                admin_decided_at = now(),
+                admin_decided_by = @a,
+                admin_note = @n
+            where id = @id
+              and status = 'pending_admin'
+            returning id;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("a", admin);
+        cmd.Parameters.AddWithValue("n", (object?)dto?.Note ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("id", id);
+
+        var updated = await cmd.ExecuteScalarAsync();
+        if (updated == null)
+            return Conflict(new { ok = false, message = "No existe o ya no está pendiente." });
+
+        return Ok(new { ok = true, id });
+    }
+
+    // ✅ ADMIN: rechazar manual
+    // POST /api/transfers/admin/manual/{id}/reject
+    [HttpPost("admin/manual/{id:long}/reject")]
+    [Authorize(Roles = "admin")]
+    public async Task<IActionResult> AdminManualReject(long id, [FromBody] ManualTransferDecisionDto? dto)
+    {
+        var admin = User.Identity?.Name ?? "admin";
+
+        await using var conn = new NpgsqlConnection(GetConn());
+        await conn.OpenAsync();
+
+        var sql = """
+            update manual_transfers
+            set status = 'rejected',
+                admin_decided_at = now(),
+                admin_decided_by = @a,
+                admin_note = @n
+            where id = @id
+              and status = 'pending_admin'
+            returning id;
+        """;
+
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("a", admin);
+        cmd.Parameters.AddWithValue("n", (object?)dto?.Note ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("id", id);
+
+        var updated = await cmd.ExecuteScalarAsync();
+        if (updated == null)
+            return Conflict(new { ok = false, message = "No existe o ya no está pendiente." });
+
+        return Ok(new { ok = true, id });
+    }
+
     // ADMIN: aceptadas por día + filtro por sucursal(username)
+    // ✅ Incluye MP + Manuales aprobadas
     // GET /api/transfers/admin/accepted/by-day?date=2026-01-03&sucursal=Banfield
     [HttpGet("admin/accepted/by-day")]
     [Authorize(Roles = "admin")]
@@ -483,30 +772,99 @@ public class TransfersController : ControllerBase
 
         var hasSucursal = !string.IsNullOrWhiteSpace(sucursal);
 
-        // ✅ MOD: join con mp_accounts para devolver nombre de cuenta receptora
+        // ✅ MP + manuales aprobadas
         var sql = hasSucursal ? """
-            select
-                t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
-                a.username, a.ack_at_utc, a.ack_date_ar,
-                t.mp_account_id,
-                coalesce(m.nombre,'') as mp_account_nombre
-            from transfer_ack a
-            join transfers t on t.id = a.transfer_id
-            left join mp_accounts m on m.id = t.mp_account_id
-            where a.ack_date_ar = @day::date
-              and a.username = @sucursal
-            order by a.ack_at_utc desc;
+            select *
+            from (
+              -- A) MP aceptadas
+              select
+                  t.id::bigint as id,
+                  t.payment_id::text as payment_id,
+                  t.fecha_utc as fecha_utc,
+                  t.monto as monto,
+                  t.payment_type::text as payment_type,
+                  t.status::text as status,
+                  a.username::text as accepted_by,
+                  a.ack_at_utc as ack_at_utc,
+                  a.ack_date_ar as ack_date_ar,
+                  t.mp_account_id as mp_account_id,
+                  coalesce(m.nombre,'') as mp_account_nombre,
+                  0::int as source_order
+              from transfer_ack a
+              join transfers t on t.id = a.transfer_id
+              left join mp_accounts m on m.id = t.mp_account_id
+              where a.ack_date_ar = @day::date
+                and a.username = @sucursal
+
+              union all
+
+              -- B) manuales aprobadas (asociadas a la cuenta de la sucursal creadora)
+              select
+                  mt.id::bigint as id,
+                  ('MANUAL-' || mt.id::text) as payment_id,
+                  mt.created_at as fecha_utc,
+                  mt.amount as monto,
+                  'manual'::text as payment_type,
+                  mt.status::text as status,
+                  mt.created_by::text as accepted_by,
+                  mt.admin_decided_at as ack_at_utc,
+                  (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date as ack_date_ar,
+                  u.mp_account_id as mp_account_id,
+                  coalesce(m2.nombre,'') as mp_account_nombre,
+                  1::int as source_order
+              from manual_transfers mt
+              join app_users u on u.username = mt.created_by
+              left join mp_accounts m2 on m2.id = u.mp_account_id
+              where mt.status = 'approved'
+                and (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date = @day::date
+                and mt.created_by = @sucursal
+            ) x
+            order by x.ack_at_utc desc nulls last, x.source_order asc;
         """ : """
-            select
-                t.id, t.payment_id, t.fecha_utc, t.monto, t.payment_type, t.status,
-                a.username, a.ack_at_utc, a.ack_date_ar,
-                t.mp_account_id,
-                coalesce(m.nombre,'') as mp_account_nombre
-            from transfer_ack a
-            join transfers t on t.id = a.transfer_id
-            left join mp_accounts m on m.id = t.mp_account_id
-            where a.ack_date_ar = @day::date
-            order by a.ack_at_utc desc;
+            select *
+            from (
+              -- A) MP aceptadas
+              select
+                  t.id::bigint as id,
+                  t.payment_id::text as payment_id,
+                  t.fecha_utc as fecha_utc,
+                  t.monto as monto,
+                  t.payment_type::text as payment_type,
+                  t.status::text as status,
+                  a.username::text as accepted_by,
+                  a.ack_at_utc as ack_at_utc,
+                  a.ack_date_ar as ack_date_ar,
+                  t.mp_account_id as mp_account_id,
+                  coalesce(m.nombre,'') as mp_account_nombre,
+                  0::int as source_order
+              from transfer_ack a
+              join transfers t on t.id = a.transfer_id
+              left join mp_accounts m on m.id = t.mp_account_id
+              where a.ack_date_ar = @day::date
+
+              union all
+
+              -- B) manuales aprobadas
+              select
+                  mt.id::bigint as id,
+                  ('MANUAL-' || mt.id::text) as payment_id,
+                  mt.created_at as fecha_utc,
+                  mt.amount as monto,
+                  'manual'::text as payment_type,
+                  mt.status::text as status,
+                  mt.created_by::text as accepted_by,
+                  mt.admin_decided_at as ack_at_utc,
+                  (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date as ack_date_ar,
+                  u.mp_account_id as mp_account_id,
+                  coalesce(m2.nombre,'') as mp_account_nombre,
+                  1::int as source_order
+              from manual_transfers mt
+              join app_users u on u.username = mt.created_by
+              left join mp_accounts m2 on m2.id = u.mp_account_id
+              where mt.status = 'approved'
+                and (mt.created_at at time zone 'America/Argentina/Buenos_Aires')::date = @day::date
+            ) x
+            order by x.ack_at_utc desc nulls last, x.source_order asc;
         """;
 
         await using var cmd = new NpgsqlCommand(sql, conn);
@@ -531,10 +889,10 @@ public class TransfersController : ControllerBase
                 payment_type = rd.GetString(4),
                 status = rd.GetString(5),
                 accepted_by = rd.GetString(6),
-                ack_at_utc = rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
+                ack_at_utc = rd.IsDBNull(7) ? null : rd.GetFieldValue<DateTimeOffset>(7).ToString("o"),
                 ack_date_ar = rd.GetFieldValue<DateTime>(8).ToString("yyyy-MM-dd"),
                 mp_account_id = rd.IsDBNull(9) ? (int?)null : rd.GetInt32(9),
-                mp_account_nombre = rd.GetString(10)
+                mp_account_nombre = rd.IsDBNull(10) ? "" : rd.GetString(10)
             });
         }
 

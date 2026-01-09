@@ -84,3 +84,4 @@ C:\Users\facu\Desktop\Proyectos\mp-transferencias-online\src\MpTransferenciasLoc
 C:\Users\facu\Desktop\Proyectos\mp-transferencias-online\src\MpTransferenciasLocal\obj\Debug\net8.0\MpTransferenciasLocal.pdb
 C:\Users\facu\Desktop\Proyectos\mp-transferencias-online\src\MpTransferenciasLocal\obj\Debug\net8.0\MpTransferenciasLocal.genruntimeconfig.cache
 C:\Users\facu\Desktop\Proyectos\mp-transferencias-online\src\MpTransferenciasLocal\obj\Debug\net8.0\ref\MpTransferenciasLocal.dll
+C:\Users\facu\Desktop\Proyectos\mp-transferencias-online\src\MpTransferenciasLocal\bin\Debug\net8.0\config\appsettings.Sucursal.json

@@ -9,8 +9,12 @@ using Npgsql;
 var builder = WebApplication.CreateBuilder(args);
 
 // ================= ONLINE HOSTING (Render/Docker/VPS) =================
-var port = Environment.GetEnvironmentVariable("PORT") ?? "5286";
-builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+// ✅ Opción A: solo forzar PORT si existe (en Render). En local deja el default de dotnet.
+var portEnv = Environment.GetEnvironmentVariable("PORT");
+if (!string.IsNullOrWhiteSpace(portEnv))
+{
+    builder.WebHost.UseUrls($"http://0.0.0.0:{portEnv}");
+}
 
 // ================= CONFIG =================
 var configFromExe = Path.Combine(AppContext.BaseDirectory, "config", "appsettings.Sucursal.json");
@@ -54,7 +58,19 @@ builder.Services.Configure<HostOptions>(o =>
 {
     o.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore;
 });
-builder.Services.AddHostedService<MpPollingService>();
+
+// ✅ Opción A: Local = DB real, SIN polling
+var disablePolling = builder.Environment.IsDevelopment()
+    || builder.Configuration.GetValue<bool>("LocalSafe:DisablePolling");
+
+if (!disablePolling)
+{
+    builder.Services.AddHostedService<MpPollingService>();
+}
+else
+{
+    Console.WriteLine("🟡 Local (Development): Polling deshabilitado (Opción A).");
+}
 
 // ================= HELPERS =================
 static bool TryGetBasicCredentials(string authHeader, out string user, out string pass)
@@ -162,16 +178,27 @@ static async Task Json503(HttpContext ctx, string msg)
 var app = builder.Build();
 
 // ================= DB INIT =================
-await DbBootstrap.EnsureCreatedAsync(app.Configuration);
+// ✅ Opción A: Local = DB real, SIN seed/bootstrap (no tocar esquema ni sembrar data)
+var disableSeed = builder.Environment.IsDevelopment()
+    || builder.Configuration.GetValue<bool>("LocalSafe:DisableSeed");
 
-try
+if (!disableSeed)
 {
-    var cs = NormalizeConnString(app.Configuration);
-    await DbSeed.SeedAsync(cs);
+    await DbBootstrap.EnsureCreatedAsync(app.Configuration);
+
+    try
+    {
+        var cs = NormalizeConnString(app.Configuration);
+        await DbSeed.SeedAsync(cs);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
+    }
 }
-catch (Exception ex)
+else
 {
-    Console.WriteLine("⚠ DbSeed falló: " + ex.Message);
+    Console.WriteLine("🟡 Local (Development): DbBootstrap/DbSeed deshabilitados (Opción A).");
 }
 
 // ================= AUTH (Basic) - POR DB =================
@@ -275,9 +302,12 @@ app.UseAuthorization();
 // ================= LOG =================
 Console.WriteLine("========================================");
 Console.WriteLine("MPTransferenciasLocal iniciado");
+Console.WriteLine("Environment: " + builder.Environment.EnvironmentName);
 Console.WriteLine("ContentRootPath: " + builder.Environment.ContentRootPath);
 Console.WriteLine("Config usado: " + (configUsado ?? "(ninguno)"));
 Console.WriteLine("Auth: DB (app_users + BCrypt) · /api protegido · home pública (sin popup)");
+Console.WriteLine("Polling: " + (disablePolling ? "OFF (Local)" : "ON"));
+Console.WriteLine("Seed/Bootstrap: " + (disableSeed ? "OFF (Local)" : "ON"));
 Console.WriteLine("========================================");
 
 // ================= ENDPOINTS =================
@@ -286,7 +316,7 @@ app.MapGet("/favicon.ico", () => Results.NoContent());
 
 app.MapControllers();
 
-// ✅ HOME (Pendientes + Aceptadas hoy + ADMIN)
+// ✅ HOME (Pendientes + Manual + Aceptadas hoy + ADMIN)
 app.MapGet("/", (IConfiguration cfg) =>
 {
     var cuenta = cfg["Sucursal"] ?? cfg["Cuenta"] ?? "Cuenta";
@@ -308,6 +338,48 @@ app.MapGet("/", (IConfiguration cfg) =>
 </div>
 """;
 
+    // ✅ NUEVO: bloque manual (cualquier usuario)
+    var manualHtml = """
+<div class='sectionTitle'>
+  <h2>Cargar transferencia manual</h2>
+  <div class='badge' id='manualStatus'>—</div>
+</div>
+
+<div class='adminBar' style='border-top:0;'>
+  <label class='adminLbl'>Nombre</label>
+  <input id='manualName' class='adminInput' placeholder='Ej: Juan Perez' style='min-width:220px;'/>
+
+  <label class='adminLbl'>Monto</label>
+  <input id='manualAmount' class='adminInput' placeholder='Ej: 15000' style='min-width:140px;' inputmode='decimal'/>
+
+  <button class='btn' onclick='createManualTransfer()'>Cargar</button>
+</div>
+
+<div class='sectionTitle' style='border-top:1px solid var(--border);'>
+  <h2>Mis manuales de hoy</h2>
+  <div class='badge'>Cant: <b id='manualMineCant'>0</b></div>
+</div>
+
+<div class='tableWrap'>
+  <table>
+    <thead>
+      <tr>
+        <th>Hora (AR)</th>
+        <th>Monto</th>
+        <th>Nombre</th>
+        <th>Estado</th>
+        <th class='muted'>ID</th>
+        <th class='muted'>Nota Admin</th>
+      </tr>
+    </thead>
+    <tbody id='manualMineBody'>
+      <tr><td colspan='6'><div class='errorBox'>Cargando…</div></td></tr>
+    </tbody>
+  </table>
+</div>
+""";
+
+    // ✅ NUEVO: admin manual pendientes + aprobar/rechazar
     var adminHtml = """
 <div id='adminSection' style='display:none;'>
   <div class='sectionTitle adminTitle'>
@@ -327,6 +399,35 @@ app.MapGet("/", (IConfiguration cfg) =>
     </select>
 
     <button class='btn' onclick='assignMpAccountToSucursal()'>Asignar</button>
+  </div>
+
+  <div class='sectionTitle adminTitle' style='border-top:1px solid var(--border);'>
+    <h2>ADMIN · Manuales pendientes</h2>
+    <div class='badge'>Cant: <b id='adminManualCant'>0</b></div>
+  </div>
+
+  <div class='adminBar'>
+    <label class='adminLbl'>Día</label>
+    <input id='adminManualDate' type='date' class='adminInput' />
+    <button class='btn' onclick='loadAdminManualPending()'>Buscar</button>
+    <span class='muted' id='adminManualHint'></span>
+  </div>
+
+  <div class='tableWrap'>
+    <table>
+      <thead>
+        <tr>
+          <th>Hora (AR)</th>
+          <th>Monto</th>
+          <th>Nombre</th>
+          <th>Cargado por</th>
+          <th>Acción</th>
+        </tr>
+      </thead>
+      <tbody id='adminManualBody'>
+        <tr><td colspan='5'><div class='errorBox'>Elegí un día para ver los manuales pendientes.</div></td></tr>
+      </tbody>
+    </table>
   </div>
 
   <div class='sectionTitle adminTitle' style='border-top:1px solid var(--border);'>
@@ -552,6 +653,8 @@ th{text-align:left;color:#cbd5e1;font-weight:700}
       </table>
     </div>
 
+    {{manualHtml}}
+
     <div class='sectionTitle'>
       <h2>Aceptadas hoy (por vos)</h2>
       <div class='badge'>Total hoy: <b id='totalHoy'>$0</b> · Cant: <b id='cantHoy'>0</b></div>
@@ -693,6 +796,20 @@ function pillClass(status) {
   const s = status.toLowerCase();
   return (s === 'approved' || s === 'accredited') ? 'ok' : 'bad';
 }
+function pillClassManual(status){
+  const s = (status||'').toLowerCase();
+  if (s === 'approved') return 'ok';
+  if (s === 'pending_admin') return 'bad';
+  if (s === 'rejected') return 'bad';
+  return 'bad';
+}
+function labelManual(status){
+  const s = (status||'').toLowerCase();
+  if (s === 'pending_admin') return 'pendiente';
+  if (s === 'approved') return 'aprobada';
+  if (s === 'rejected') return 'rechazada';
+  return status || '';
+}
 function toArDate(iso) {
   try {
     const d = new Date(iso);
@@ -797,6 +914,73 @@ async function ackTransfer(id, btn) {
   }
 }
 
+// ===== MANUAL (nuevo) =====
+async function createManualTransfer(){
+  const name = (document.getElementById('manualName')?.value || '').trim();
+  const amountRaw = (document.getElementById('manualAmount')?.value || '').trim();
+  const status = document.getElementById('manualStatus');
+
+  if (!name || !amountRaw){
+    if (status) status.textContent = 'Completá nombre y monto';
+    return;
+  }
+
+  const amount = Number(String(amountRaw).replace(',','.'));
+  if (!isFinite(amount) || amount <= 0){
+    if (status) status.textContent = 'Monto inválido';
+    return;
+  }
+
+  try{
+    if (status) status.textContent = 'Cargando...';
+
+    await apiJson('/api/transfers/manual', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payerName: name, amount })
+    });
+
+    if (status) status.textContent = 'OK · Enviado a Admin';
+    document.getElementById('manualName').value = '';
+    document.getElementById('manualAmount').value = '';
+
+    await loadManualMineToday();
+    // acceptedToday no cambia hasta que admin apruebe, pero refrescamos igual
+    await loadAcceptedToday();
+  }catch(e){
+    if (status) status.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function loadManualMineToday(){
+  const body = document.getElementById('manualMineBody');
+  const cant = document.getElementById('manualMineCant');
+  try{
+    const j = await apiJson('/api/transfers/manual/mine/today');
+
+    cant.textContent = String(j.count || 0);
+
+    if (!j.items || j.items.length === 0){
+      body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>No cargaste manuales hoy.</div></td></tr>`;
+      return;
+    }
+
+    body.innerHTML = j.items.map(x => `
+      <tr>
+        <td class='mono'>${toArDate(x.fecha_utc)}</td>
+        <td class='money'>${arMoney.format(x.monto)}</td>
+        <td class='mono'>${(x.payer_name || '').toString()}</td>
+        <td><span class='pill ${pillClassManual(x.status)}'>${labelManual(x.status)}</span></td>
+        <td class='muted mono'>${x.id}</td>
+        <td class='muted mono'>${(x.admin_note || '')}</td>
+      </tr>
+    `).join('');
+  }catch(e){
+    cant.textContent = '0';
+    body.innerHTML = `<tr><td colspan='6'><div class='errorBox'>Error cargando manuales: ${e.message}</div></td></tr>`;
+  }
+}
+
 // ===== ADMIN =====
 async function loadAdminSucursales() {
   const sel = document.getElementById('adminSucursal');
@@ -859,6 +1043,93 @@ async function loadAdminAcceptedByDay() {
     body.innerHTML = `<tr><td colspan='7'><div class='errorBox'>Error cargando admin: ${e.message}</div></td></tr>`;
     total.textContent = '$0';
     cant.textContent = '0';
+  }
+}
+
+// ✅ ADMIN manual pendientes
+function setAdminManualDefaultDateToday(){
+  const input = document.getElementById('adminManualDate');
+  if (!input) return;
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth()+1).padStart(2,'0');
+  const dd = String(now.getDate()).padStart(2,'0');
+  input.value = `${yyyy}-${mm}-${dd}`;
+}
+
+async function loadAdminManualPending(){
+  const input = document.getElementById('adminManualDate');
+  const body = document.getElementById('adminManualBody');
+  const cant = document.getElementById('adminManualCant');
+  const hint = document.getElementById('adminManualHint');
+
+  if (!input || !body) return;
+  const date = input.value;
+  if (!date){
+    if (hint) hint.textContent = 'Elegí una fecha.';
+    return;
+  }
+  if (hint) hint.textContent = '';
+
+  try{
+    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Cargando…</div></td></tr>`;
+    const j = await apiJson(`/api/transfers/admin/manual/pending?date=${encodeURIComponent(date)}`);
+
+    cant.textContent = String(j.count || 0);
+
+    if (!j.items || j.items.length === 0){
+      body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>No hay manuales pendientes para ese día.</div></td></tr>`;
+      return;
+    }
+
+    body.innerHTML = j.items.map(x => `
+      <tr>
+        <td class='mono'>${toArDate(x.fecha_utc)}</td>
+        <td class='money'>${arMoney.format(x.monto)}</td>
+        <td class='mono'>${(x.payer_name || '')}</td>
+        <td class='mono'>${(x.created_by || '')}</td>
+        <td>
+          <button class='btn' onclick='adminApproveManual(${x.id}, this)'>Aprobar</button>
+          <button class='btn btnDanger' onclick='adminRejectManual(${x.id}, this)'>Rechazar</button>
+        </td>
+      </tr>
+    `).join('');
+  }catch(e){
+    cant.textContent = '0';
+    body.innerHTML = `<tr><td colspan='5'><div class='errorBox'>Error cargando manuales: ${e.message}</div></td></tr>`;
+  }
+}
+
+async function adminApproveManual(id, btn){
+  try{
+    btn.disabled = true;
+    await apiJson(`/api/transfers/admin/manual/${id}/approve`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ note: '' })
+    });
+    await loadAdminManualPending();
+    await refreshAll(); // para que al usuario le aparezca en aceptadas cuando corresponda
+    await loadAdminAcceptedByDay();
+  }catch(e){
+    btn.disabled = false;
+    alert('Error aprobando: ' + e.message);
+  }
+}
+
+async function adminRejectManual(id, btn){
+  try{
+    btn.disabled = true;
+    await apiJson(`/api/transfers/admin/manual/${id}/reject`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ note: '' })
+    });
+    await loadAdminManualPending();
+    await refreshAll();
+  }catch(e){
+    btn.disabled = false;
+    alert('Error rechazando: ' + e.message);
   }
 }
 
@@ -927,6 +1198,7 @@ async function assignMpAccountToSucursal() {
 
 async function refreshAll() {
   await loadPending();
+  await loadManualMineToday();
   await loadAcceptedToday();
 }
 
@@ -934,10 +1206,15 @@ async function initAdminIfPossible(){
   try{
     await apiJson('/api/transfers/admin/sucursales');
     document.getElementById('adminSection').style.display = 'block';
+
     setAdminDefaultDateToday();
+    setAdminManualDefaultDateToday();
+
     await loadAdminSucursales();
     await loadAssignSucursales();
     await loadMpAccounts();
+
+    await loadAdminManualPending();
     await loadAdminAcceptedByDay();
   }catch{
     document.getElementById('adminSection').style.display = 'none';
@@ -972,6 +1249,7 @@ async function initAfterLogin(){
 """;
 
     html = html.Replace("{{adminHtml}}", adminHtml);
+    html = html.Replace("{{manualHtml}}", manualHtml);
     html = html.Replace("{{accountBoxHtml}}", accountBoxHtml);
     html = html.Replace("{{cuenta}}", cuenta);
 
